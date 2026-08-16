@@ -1,93 +1,170 @@
 # NetScanner
 
 ```bash
-                )           (                   )    )     (     
-             ( /(      *   ))\ )  (    (     ( /( ( /(     )\ )  
-             )\())(  ` )  /(()/(  )\   )\    )\()))\())(  (()/(  
-            ((_)\ )\  ( )(_))(_)|((_|(((_)( ((_)\((_)\ )\  /(_)) 
-             _((_|(_)(_(_()|_)) )\___)\ _ )\ _((_)_((_|(_)(_))   
-            | \| | __|_   _/ __((/ __(_)_\(_) \| | \| | __| _ \  
-            | .` | _|  | | \__ \| (__ / _ \ | .` | .` | _||   /  
-            |_|\_|___| |_| |___/ \___/_/ \_\|_|\_|_|\_|___|_|_\
-  
-````
+                )           (                   )    )     (
+             ( /(      *   ))\ )  (    (     ( /( ( /(     )\ )
+             )\())(  ` )  /(()/(  )\   )\    )\()))\())(  (()/(
+            ((_)\ )\  ( )(_))(_)|((_|(((_)( ((_)\\((_)\ )\  /(_))
+             _((_|(_)(_(_()|_)) )\___)\ _ )\ _((_)_((_|(_)(_))
+            | \| | __|_   _/ __((/ __(_)_\(_) \| | \| | __| _ \
+            | .` | _|  | | \__ \| (__ / _ \ | .` | .` | _||   /
+            |_|\_|___| |_| |___/ \___/_/ \_\_|_|\_|_|\_|___|_|_\
+        =============================================================
+                    Version: 2.0     Twitter: anishalx7
+        =============================================================
+```
 
 ## Overview
 
-Welcome to **NetScanner**, your go-to tool for effortlessly discovering devices on your local network! Built with Python and Scapy, NetScanner provides a clean and intuitive command-line interface for scanning IP addresses and retrieving essential information about connected devices.
+**NetScanner** is a fast, cross-platform network discovery and port-scanning tool built with Python and [Scapy](https://scapy.readthedocs.io/). Discover devices on your local network, sweep subnets with ICMP, or scan for open TCP ports — all from a clean command-line interface.
 
 ### Why Use NetScanner?
 
-- **User-Friendly**: Designed for both beginners and experienced users, making network scanning simple and efficient.
-- **Versatile**: Whether you’re a network administrator, security professional, or just a tech enthusiast, NetScanner meets your needs.
-- **Real-Time Results**: Quickly identify devices connected to your network, including their IP and MAC addresses.
+- **User-Friendly**: Designed for both beginners and experienced users.
+- **Versatile**: ARP host discovery, ICMP ping sweeps, and TCP port scans in one tool.
+- **Fast**: Concurrent probes with tunable thread counts and timeouts.
+- **Scriptable**: Table, JSON, or CSV output, with optional file export.
 
-## Features
+## Features (v2)
 
-- **Cross-Platform Compatibility**: Use NetScanner on Windows, macOS, and Linux systems.
-- **Target Customization**: Easily specify single IPs, ranges, or subnets to scan.
-- **Detailed Output**: View a comprehensive list of all detected devices in a clear format.
-- **Guided Error Handling**: Friendly error messages help you troubleshoot input issues.
+- **Three scan methods** (`arp`, `ping`, `tcp`) plus automatic `all` mode:
+  - `arp` — Layer-2 host discovery on your local segment (IP + MAC + vendor)
+  - `ping` — ICMP echo sweep
+  - `tcp` — privilege-free TCP connect port scan (works without admin/root)
+  - `all` — runs ARP and ICMP, degrading gracefully if either needs privileges; if nothing is found, falls back to a TCP scan of common ports
+- **Flexible targets**: single IP, CIDR (`192.168.1.0/24`), hyphen ranges (`192.168.1.1-50`), hostnames, and comma-separated combinations
+- **MAC vendor lookup** from a built-in OUI database (plus custom `--vendor-db` support)
+- **Output formats**: aligned table, JSON, or CSV, written to stdout or a file (`-o`)
+- **Concurrency & tuning**: `--concurrency`, `--timeout`, `--retries`, `--iface`
+- **Hostname resolution** for discovered devices (`--resolve`)
+- **Structured error handling**: clear messages for bad targets, missing privileges, and missing drivers — never a raw traceback
+- **Fully unit-tested** (66 tests, all network calls mocked), with CI across Python 3.9–3.13
 
 ## Installation
 
 ### Prerequisites
 
-To run NetScanner, ensure you have:
+- **Python 3.8+**
+- **Scapy**: `pip install scapy`
+- **For `arp`/`ping` on Windows**: [Npcap](https://npcap.com/) (with "WinPcap API-compatible Mode") and an **administrator** shell. On Linux/macOS, `arp`/`ping` need **root** (or CAP_NET_RAW). `tcp` scans work everywhere with no special privileges.
 
-- **Python 3.x** installed on your machine.
-- The **Scapy** library. Install it via pip:
-
-```bash
-pip install scapy
-```
-### Clone the Repository
-
-1. Open your terminal (Command Prompt on Windows, Terminal on macOS/Linux).
-2. Clone the repository:
+### Install as a package (recommended)
 
 ```bash
-git clone https://github.com/anishalx/netscanner.git
+git clone https://github.com/anishalx/net-scanner.git   # or your fork
 cd netscanner
+pip install -e .           # installs the `netscanner` command
 ```
-### Usage
-To start scanning, run the script with your desired target IP or IP range:
+
+### Or run straight from the repo (v1-style)
+
 ```bash
-python netscanner.py -t {your:IP eg.192.168.1.0/24}
+python netscanner.py -t 192.168.1.0/24
 ```
+
+## Usage
+
+```bash
+netscanner -t <target> [options]
+```
+
+### Examples
+
+```bash
+# Discover devices on the local /24 (auto: ARP + ICMP + TCP fallback)
+netscanner -t 192.168.1.0/24
+
+# Classic ARP-only scan of the local segment (needs admin/root)
+netscanner -t 192.168.1.0/24 -m arp
+
+# ICMP sweep of a range
+netscanner -t 192.168.1.1-192.168.1.50 -m ping
+
+# Port scan a single host (no privileges needed)
+netscanner -t 192.168.1.5 -m tcp -p 1-1000
+
+# Port scan with a custom port list
+netscanner -t 192.168.1.5 -m tcp -p 22,80,443,8000-9000
+
+# Machine-readable output to a file
+netscanner -t 192.168.1.0/24 -f json -o scan.json
+netscanner -t 192.168.1.0/24 -f csv -o scan.csv
+
+# Resolve hostnames and show MAC vendors
+netscanner -t 192.168.1.0/24 -m arp --resolve
+
+# Use a custom OUI vendor database (lines of "OUI,Vendor" or "OUI - Vendor")
+netscanner -t 192.168.1.0/24 -m arp --vendor-db oui.csv
+
+# Scan faster/slower by tuning concurrency and timeouts
+netscanner -t 10.0.0.0/24 --concurrency 64 --timeout 1
+```
+
 ### Example Output
 
-  <p align="center"><img src="https://www.imghost.net/ib/CVPFeSCQEvU5fKS_1727111197.png" width="50%" height="20%"/></p> 
-
-## Demo 
-  <p align="center">
-  <a href="https://www.youtube.com/watch?v=xmOvvurg90A">
-    <img src="https://img.youtube.com/vi/xmOvvurg90A/maxresdefault.jpg" alt="Watch the video" width="600">
-  </a>
-</p>
-
-### Need Help?
-For a detailed list of options and usage instructions, simply run:
-```bash
-python netscanner.py -h
 ```
+IP Address    MAC Address       Vendor                  Hostname
+-----------   ----------------  ---------------------   --------
+192.168.1.1   aa:bb:cc:dd:ee:ff TP-Link
+192.168.1.10  b8:27:eb:12:34:56 Raspberry Pi Foundation
+192.168.1.20
+```
+
+### Options
+
+```
+-t, --target TARGET   IP, CIDR range, hyphen range, hostname, or comma list
+-m, --method          arp | ping | tcp | all   (default: all)
+-p, --ports PORTS     Ports for -m tcp: '22', '80,443', '1-1000'
+-f, --format          table | json | csv       (default: table)
+-o, --output FILE     Write results to a file
+    --iface IFACE     Network interface for ARP/ping (e.g. eth0, Wi-Fi)
+    --timeout SECS    Timeout per probe          (default: 2.0)
+    --retries N       Probe retries              (default: 1)
+    --concurrency N   Parallel probes            (default: 32)
+    --resolve         Reverse-DNS hostnames (slower)
+    --vendor-db FILE  Custom OUI vendor database
+    --no-banner       Suppress the ASCII banner
+-v, --verbose         Debug logging
+    --version         Show version
+```
+
+Run `netscanner -h` for the full help text.
+
+## Development
+
+```bash
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"      # Windows: .venv\Scripts\pip
+.venv/bin/python -m pytest             # run the test suite
+```
+
+All tests mock network access, so they run anywhere — no root or Npcap needed.
+
 ## Operating Systems
 
-NetScanner is compatible with:
+- **Windows**: Command Prompt or PowerShell (Npcap + admin shell for ARP/ping).
+- **macOS / Linux**: Any terminal (root or `CAP_NET_RAW` for ARP/ping).
 
-- **Windows**: Use Command Prompt or PowerShell.
-- **macOS**: Utilize Terminal for seamless execution.
-- **Linux**: Run in any terminal emulator of your choice.
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `ARP scan failed ... winpcap is not installed` | Install [Npcap](https://npcap.com/) and run as administrator |
+| `ICMP ping requires administrator/root privileges` | Run as root/admin, or use `-m tcp` |
+| `No devices found` | Try `-m ping` or `-m tcp`; the auto `all` mode does this for you |
+| `Invalid target(s)` | Use IPv4, e.g. `192.168.1.0/24`, `192.168.1.1-50`, or a resolvable hostname |
+| Unknown MAC vendors | Provide a full IEEE OUI CSV via `--vendor-db` |
 
 ## Contributing
 
-We welcome contributions from the community! If you have ideas for improvements or new features, please follow these steps:
+We welcome contributions! Please:
 
-1. **Fork the repository**.
-2. **Create a new branch** (`git checkout -b feature/YourFeature`).
-3. **Make your changes** and commit them (`git commit -m 'Add some feature'`).
-4. **Push your branch** (`git push origin feature/YourFeature`).
-5. **Open a pull request**.
+1. Fork the repository.
+2. Create a branch (`git checkout -b feature/YourFeature`).
+3. Make your changes and add tests under `tests/`.
+4. Run `pytest` and push.
+5. Open a pull request.
 
 ## License
 
@@ -97,4 +174,3 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 - Special thanks to [Scapy](https://scapy.readthedocs.io/en/latest/) for powering this tool.
 - Inspired by various network scanning tools and the open-source community.
-
