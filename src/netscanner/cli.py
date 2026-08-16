@@ -12,15 +12,25 @@ from . import __version__
 from .output import (
     HOST_COLUMNS,
     PORT_COLUMNS,
+    SYN_COLUMNS,
     format_csv,
     format_json,
     format_jsonl,
     format_table,
     write_output,
 )
-from .scanner import COMMON_PORTS, ScanError, discover_hosts, port_scan, syn_scan, udp_scan
+from .scanner import (
+    COMMON_PORTS,
+    UDP_PROBES,
+    ScanError,
+    discover_hosts,
+    load_probe_db,
+    port_scan,
+    syn_scan,
+    udp_scan,
+)
 from .target import TargetError, parse_ports, parse_targets
-from .utils import colorize, is_admin, setup_logging
+from .utils import ProgressReporter, colorize, is_admin, setup_logging
 from .vendor import load_vendor_db
 
 LOG = logging.getLogger("netscanner")
@@ -120,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="iface",
         default=None,
         metavar="IFACE",
-        help="Network interface for ARP/ping (e.g. eth0, Wi-Fi)",
+        help="Network interface for ARP scans (e.g. eth0, Wi-Fi)",
     )
     parser.add_argument(
         "--timeout",
@@ -162,6 +172,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--probes",
+        dest="probes_file",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Custom UDP probe file for -m udp (JSON: port -> hex payload); "
+            "overrides the built-in probes for those ports"
+        ),
+    )
+    parser.add_argument(
+        "--no-probes",
+        dest="no_probes",
+        action="store_true",
+        help="With -m udp, disable built-in protocol probes (empty datagram to every port)",
+    )
+    parser.add_argument(
         "--vendor-db",
         dest="vendor_db",
         default=None,
@@ -174,12 +200,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Suppress the ASCII banner",
     )
-    parser.add_argument(
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
         "-v",
         "--verbose",
         dest="verbose",
         action="store_true",
         help="Verbose (debug) logging",
+    )
+    verbosity.add_argument(
+        "-q",
+        "--quiet",
+        dest="quiet",
+        action="store_true",
+        help="Suppress warnings and progress output",
     )
     parser.add_argument(
         "--version",
@@ -191,8 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     argv_list = list(argv) if argv is not None else sys.argv[1:]
-    setup_logging(verbose="-v" in argv_list or "--verbose" in argv_list)
     args = build_parser().parse_args(argv_list)
+    setup_logging(verbose=args.verbose, quiet=args.quiet)
 
     try:
         targets = parse_targets([args.target])
@@ -224,10 +258,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         except TargetError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        columns = PORT_COLUMNS
+        columns = SYN_COLUMNS if args.method == "syn" else PORT_COLUMNS
     else:
         ports = None
         columns = HOST_COLUMNS
+
+    reporter = ProgressReporter("Scan", enabled=not args.quiet)
+
+    # Custom/disabled UDP probes. Computed once and passed to udp_scan; the
+    # effective table is: built-ins (unless --no-probes) plus any --probes file.
+    probes = None
+    if args.probes_file or args.no_probes:
+        if args.method != "udp":
+            LOG.warning("--probes/--no-probes only affect -m udp; ignoring for this scan")
+        probes = {}
+        if not args.no_probes:
+            probes.update(UDP_PROBES)
+        if args.probes_file:
+            try:
+                probes.update(load_probe_db(args.probes_file))
+            except (OSError, ValueError) as exc:
+                print(f"ERROR: could not load probe file: {exc}", file=sys.stderr)
+                return 1
 
     # jsonl streams port-scan results as they are discovered (memory-bounded,
     # and tailable with -o); host discovery keeps collecting before emitting.
@@ -241,6 +293,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
                     stream=True,
+                    progress=reporter.callback,
+                    probes=probes,
                 )
             elif args.method == "syn":
                 entries = syn_scan(
@@ -248,10 +302,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ports,
                     timeout=args.timeout,
                     retries=args.retries,
-                    iface=args.iface,
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
                     stream=True,
+                    progress=reporter.callback,
                 )
             else:
                 entries = port_scan(
@@ -261,6 +315,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     concurrency=args.concurrency,
                     resolve=args.resolve,
                     stream=True,
+                    progress=reporter.callback,
                 )
         except ScanError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -276,6 +331,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     timeout=args.timeout,
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
+                    progress=reporter.callback,
+                    probes=probes,
                 )
             elif args.method == "syn":
                 results = syn_scan(
@@ -283,9 +340,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     ports,
                     timeout=args.timeout,
                     retries=args.retries,
-                    iface=args.iface,
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
+                    progress=reporter.callback,
                 )
             else:
                 results = port_scan(
@@ -294,6 +351,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     timeout=args.timeout,
                     concurrency=args.concurrency,
                     resolve=args.resolve,
+                    progress=reporter.callback,
                 )
         else:
             results = discover_hosts(
@@ -305,6 +363,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 concurrency=args.concurrency,
                 resolve=args.resolve,
                 vendor_db=vendor_db,
+                progress=reporter.callback,
             )
     except ScanError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

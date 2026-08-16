@@ -31,13 +31,14 @@
   - `arp` — Layer-2 host discovery on your local segment (IP + MAC + vendor)
   - `ping` — ICMP echo sweep
   - `tcp` — privilege-free TCP connect port scan (works without admin/root)
-  - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`)
+  - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`); sends protocol probes to well-known service ports (DNS 53, NTP 123, NetBIOS 137, SNMP 161) so live services report definitively `open`
   - `syn` — half-open TCP SYN scan (needs admin/root; stealthier — the target never sees an established connection)
   - `all` — runs ARP and ICMP, degrading gracefully if either needs privileges; if nothing is found, falls back to a TCP scan of common ports
 - **Flexible targets**: single IP, CIDR (`192.168.1.0/24`), hyphen ranges (`192.168.1.1-50`), hostnames, and comma-separated combinations
 - **MAC vendor lookup**: the full IEEE OUI database (~40k vendors) is bundled with the tool, layered under friendly curated names, plus custom `--vendor-db` overrides
 - **Output formats**: aligned table, JSON, CSV, or JSON Lines (`jsonl`) — the `jsonl` format **streams** port-scan results as they are discovered, so very large scans stay memory-bounded and `-o scan.jsonl` is tailable while it runs
 - **Concurrency & tuning**: `--concurrency`, `--timeout`, `--retries`, `--iface`
+- **Live progress reporting**: long scans show a rate-limited `done/total (%)` indicator on stderr (auto-hidden for small scans, and a `completed X/Y in Zs` summary always goes to stderr so stdout stays clean for data); `-q/--quiet` silences all of it
 - **Hostname resolution** for discovered devices (`--resolve`)
 - **Structured error handling**: clear messages for bad targets, missing privileges, and missing drivers — never a raw traceback
 - **Fully unit-tested** (66 tests, all network calls mocked), with CI across Python 3.9–3.13
@@ -130,18 +131,20 @@ IP Address    MAC Address       Vendor                  Hostname
 -m, --method          arp | ping | tcp | udp | syn | all   (default: all)
 -p, --ports PORTS     Ports for -m tcp / -m udp / -m syn: '22', '80,443', '1-1000'
     --include-closed  With -m udp / -m syn, also list closed/filtered ports
+    --probes FILE     Custom UDP probe file (JSON: port -> hex payload); -m udp
+    --no-probes       With -m udp, disable built-in protocol probes
 -f, --format          table | json | csv | jsonl   (default: table)
                       jsonl streams port-scan results as they are discovered
 -o, --output FILE     Write results to a file
-    --iface IFACE     Network interface for ARP/ping (e.g. eth0, Wi-Fi)
+    --iface IFACE     Network interface for ARP scans (e.g. eth0, Wi-Fi)
     --timeout SECS    Timeout per probe          (default: 2.0)
     --retries N       Probe retries              (default: 1)
     --concurrency N   Parallel probes            (default: 32)
     --resolve         Reverse-DNS hostnames (slower)
     --vendor-db FILE  Custom OUI vendor database
-    --no-banner       Suppress the ASCII banner
--v, --verbose         Debug logging
-    --version         Show version
+    --no-banner       Suppress the ASCII banner-v, --verbose         Debug logging
+-q, --quiet           Suppress warnings and progress output
+    --version             Show version
 ```
 
 Run `netscanner -h` for the full help text.
@@ -169,7 +172,7 @@ All tests mock network access, so they run anywhere — no root or Npcap needed.
 | `ICMP ping requires administrator/root privileges` | Run as root/admin, or use `-m tcp` |
 | `SYN scan failed ... raw sockets unavailable` | SYN scanning needs admin/root (and Npcap on Windows); use `-m tcp` for an unprivileged equivalent |
 | `No devices found` | Try `-m ping` or `-m tcp`; the auto `all` mode does this for you |
-| UDP shows only `open|filtered` | Normal — most UDP services only reply to protocol-specific probes (DNS/SNMP/NTP queries); `open|filtered` means no reply and no ICMP error |
+| UDP shows only `open|filtered` | Expected for ports that don't answer empty datagrams. Known service ports (53 DNS, 123 NTP, 137 NetBIOS, 161 SNMP) receive protocol probes automatically and report `open` when a live service answers; other ports report `open|filtered` when they stay silent |
 | `Invalid target(s)` | Use IPv4, e.g. `192.168.1.0/24`, `192.168.1.1-50`, or a resolvable hostname |
 | Unknown MAC vendors | Refresh the bundled database: `python tools/update_oui_db.py`, or supply your own `--vendor-db` CSV |
 
@@ -182,6 +185,21 @@ We welcome contributions! Please:
 3. Make your changes and add tests under `tests/`.
 4. Run `pytest` and push.
 5. Open a pull request.
+
+### Custom UDP probes
+
+Well-known UDP service ports get protocol probes automatically (DNS 53, NTP 123, NetBIOS 137, SNMP 161). You can extend or override them with a JSON file mapping ports to hex payloads:
+
+```json
+{"53": "1234010000010000000000000776657273696f6e0462696e640000100003"}
+```
+
+```bash
+netscanner -t 192.168.1.5 -m udp -p 53,500 --probes probes.json
+netscanner -t 192.168.1.5 -m udp -p 53 --no-probes        # disable all probes
+```
+
+`--no-probes` disables the built-in table; `--probes FILE` entries override the built-ins for the same ports (use both to replace the table entirely).
 
 ## Updating the MAC vendor database
 

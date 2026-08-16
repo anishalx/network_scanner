@@ -136,6 +136,98 @@ def test_syn_jsonl_stream(monkeypatch, capsys):
     assert json.loads(out.splitlines()[0]) == FAKE_PORTS[0]
 
 
+def test_syn_scan_table_includes_os_column(monkeypatch, capsys):
+    fake = [
+        {
+            "ip": "192.168.1.10",
+            "port": 80,
+            "service": "http",
+            "state": "open",
+            "os": "Windows 10/11",
+            "ttl": 128,
+            "window": 64240,
+        }
+    ]
+    monkeypatch.setattr(cli, "syn_scan", lambda *a, **k: fake)
+    code = cli.main(["-t", "192.168.1.10", "-m", "syn", "-p", "80"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Windows 10/11" in out
+    assert "TTL" in out
+    assert "Window" in out
+
+
+def test_udp_probes_flag_merges_builtin_and_custom(monkeypatch, tmp_path):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text('{"500": "deadbeef"}')
+    captured = {}
+
+    def fake_udp_scan(*a, **k):
+        captured["probes"] = k.get("probes")
+        return []
+
+    monkeypatch.setattr(cli, "udp_scan", fake_udp_scan)
+    code = cli.main(["-t", "192.168.1.10", "-m", "udp", "-p", "53,500", "--probes", str(probe_file)])
+    assert code == 0
+    probes = captured["probes"]
+    assert probes[500] == b"\xde\xad\xbe\xef"  # custom override
+    assert probes[53] == cli.UDP_PROBES[53]  # built-in still present
+
+
+def test_udp_no_probes_flag(monkeypatch, capsys):
+    captured = {}
+
+    def fake_udp_scan(*a, **k):
+        captured["probes"] = k.get("probes")
+        return []
+
+    monkeypatch.setattr(cli, "udp_scan", fake_udp_scan)
+    code = cli.main(["-t", "192.168.1.10", "-m", "udp", "-p", "53", "--no-probes"])
+    assert code == 0
+    assert captured["probes"] == {}
+
+
+def test_udp_no_probes_plus_custom_file(monkeypatch, tmp_path):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text('{"500": "deadbeef"}')
+    captured = {}
+
+    def fake_udp_scan(*a, **k):
+        captured["probes"] = k.get("probes")
+        return []
+
+    monkeypatch.setattr(cli, "udp_scan", fake_udp_scan)
+    code = cli.main(
+        ["-t", "192.168.1.10", "-m", "udp", "-p", "500", "--no-probes", "--probes", str(probe_file)]
+    )
+    assert code == 0
+    assert captured["probes"] == {500: b"\xde\xad\xbe\xef"}  # built-ins off, custom only
+
+
+def test_invalid_probe_file_exits_1(tmp_path, capsys):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text("not json")
+    code = cli.main(["-t", "192.168.1.10", "-m", "udp", "-p", "53", "--probes", str(probe_file)])
+    assert code == 1
+    assert "probe" in capsys.readouterr().err.lower()
+
+
+def test_probes_flag_ignored_for_tcp_scan(monkeypatch, tmp_path, caplog):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text('{"500": "deadbeef"}')
+    captured = {}
+
+    def fake_port_scan(*a, **k):
+        captured["probes"] = k.get("probes")
+        return []
+
+    monkeypatch.setattr(cli, "port_scan", fake_port_scan)
+    code = cli.main(["-t", "192.168.1.10", "-m", "tcp", "-p", "80", "--probes", str(probe_file)])
+    assert code == 0
+    assert captured["probes"] is None  # never passed to tcp
+    assert "only affect -m udp" in caplog.text
+
+
 def test_udp_include_closed_flag_passed(monkeypatch, capsys):
     captured = {}
 
@@ -190,4 +282,52 @@ def test_empty_results_message(monkeypatch, capsys):
 def test_missing_target_arg_exits_2(capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main([])
+    assert exc.value.code == 2
+
+
+def test_progress_summary_shown_by_default(monkeypatch, capsys):
+    def fake_discover(*a, **k):
+        progress = k.get("progress")
+        if progress:
+            progress(100, 100)
+        return []
+
+    monkeypatch.setattr(cli, "discover_hosts", fake_discover)
+    code = cli.main(["-t", "192.168.1.0/24"])
+    assert code == 0
+    assert "completed 100/100" in capsys.readouterr().err
+
+
+def test_quiet_suppresses_progress(monkeypatch, capsys):
+    def fake_discover(*a, **k):
+        progress = k.get("progress")
+        if progress:
+            progress(100, 100)
+        return []
+
+    monkeypatch.setattr(cli, "discover_hosts", fake_discover)
+    code = cli.main(["-t", "192.168.1.0/24", "-q"])
+    assert code == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_quiet_suppresses_warnings(monkeypatch, caplog):
+    monkeypatch.setattr(cli, "is_admin", lambda: False)
+    monkeypatch.setattr(cli, "discover_hosts", lambda *a, **k: [])
+    code = cli.main(["-t", "192.168.1.10", "-m", "arp", "-q"])
+    assert code == 0
+    assert "administrator/root privileges" not in caplog.text
+
+
+def test_warning_shown_by_default(monkeypatch, caplog):
+    monkeypatch.setattr(cli, "is_admin", lambda: False)
+    monkeypatch.setattr(cli, "discover_hosts", lambda *a, **k: [])
+    code = cli.main(["-t", "192.168.1.10", "-m", "arp"])
+    assert code == 0
+    assert "administrator/root privileges" in caplog.text
+
+
+def test_quiet_and_verbose_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["-t", "192.168.1.10", "-q", "-v"])
     assert exc.value.code == 2

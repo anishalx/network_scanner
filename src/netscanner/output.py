@@ -22,6 +22,13 @@ PORT_COLUMNS: List[Tuple[str, str]] = [
     ("state", "State"),
 ]
 
+# SYN scans additionally fingerprint open ports from the SYN-ACK (TTL/window).
+SYN_COLUMNS: List[Tuple[str, str]] = PORT_COLUMNS + [
+    ("os", "OS"),
+    ("ttl", "TTL"),
+    ("window", "Window"),
+]
+
 
 def _cell(value) -> str:
     return "" if value is None else str(value)

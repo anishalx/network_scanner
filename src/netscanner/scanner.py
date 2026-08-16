@@ -8,9 +8,18 @@ report clear errors when the library is missing.
 from __future__ import annotations
 
 import errno
+import json
+import logging
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+# Scapy's own loggers spam stderr (e.g. "No libpcap provider available !")
+# during `import scapy.all`, even for scans that never touch raw sockets.
+# Silence them BEFORE importing scapy; NetScanner raises its own targeted
+# errors when raw sockets are actually needed.
+for _scapy_logger in ("scapy", "scapy.runtime", "scapy.loading", "scapy.error"):
+    logging.getLogger(_scapy_logger).setLevel(logging.CRITICAL)
 
 try:
     from scapy.all import ARP, Ether, ICMP, IP, TCP, send, sr1, srp  # noqa: F401
@@ -21,10 +30,70 @@ except ImportError:
     HAVE_SCAPY = False
 
 from . import vendor as vendor_mod
+from .osdetect import guess_os
 from .utils import LOG, normalize_mac, resolve_hostname
 
 # Used for TCP liveness probing in "all" mode and as the default port set.
 COMMON_PORTS = [22, 53, 80, 443, 445, 3389, 8080]
+
+# Protocol-specific UDP probes sent to well-known service ports so a live
+# service answers and the port can be reported as definitively "open"
+# instead of the ambiguous "open|filtered". Other ports get an empty
+# datagram. Payloads follow nmap's well-known probe formats.
+UDP_PROBES: Dict[int, bytes] = {
+    # DNS: version.bind. CHAOS TXT query
+    53: b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        b"\x07version\x04bind\x00\x00\x10\x00\x03",
+    # NTP: v3 client request (LI=0, VN=3, Mode=3), 48 bytes
+    123: b"\x1b" + b"\x00" * 47,
+    # NetBIOS: NBSTAT name service query
+    137: b"\x80\xf0\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00"
+         b"\x20CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01",
+    # SNMP: v1 GET for sysDescr.0 (1.3.6.1.2.1.1.1.0), community "public"
+    161: b"\x30\x29\x02\x01\x01\x04\x06public\xa0\x1c\x02\x04\x01\x02\x03\x04"
+         b"\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08"
+         b"\x2b\x06\x01\x02\x01\x01\x01\x00\x05\x00",
+}
+
+
+def load_probe_db(path: str) -> Dict[int, bytes]:
+    """Load custom UDP probes from a JSON file: {"<port>": "<hex payload>"}.
+
+    Example:
+        {"53": "1234010000010000000000000776657273696f6e0462696e640000100003"}
+
+    Whitespace inside hex strings is allowed. Raises ValueError with a
+    descriptive message on malformed input.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError:
+        raise
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid probe file (bad JSON): {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("Probe file must be a JSON object mapping port -> hex payload")
+
+    probes: Dict[int, bytes] = {}
+    for raw_port, raw_hex in data.items():
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid probe port: '{raw_port}'") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Probe port out of range (1-65535): '{raw_port}'")
+        if not isinstance(raw_hex, str) or not raw_hex.strip():
+            raise ValueError(f"Probe for port {port} must be a hex string")
+        hex_str = "".join(raw_hex.split())
+        if len(hex_str) % 2 != 0:
+            raise ValueError(f"Probe for port {port} has an odd number of hex digits")
+        try:
+            probes[port] = bytes.fromhex(hex_str)
+        except ValueError as exc:
+            raise ValueError(f"Probe for port {port} is not valid hex: {exc}") from exc
+    return probes
 
 def _ip_key(ip: str) -> Tuple[int, ...]:
     return tuple(int(part) for part in ip.split("."))
@@ -42,6 +111,9 @@ class ScanError(RuntimeError):
     """Raised when a scan cannot be performed (privileges, missing driver, etc.)."""
 
 
+ProgressCallback = Callable[[int, int], None]
+
+
 def _require_scapy() -> None:
     if not HAVE_SCAPY:
         raise ScanError(
@@ -53,23 +125,28 @@ def _map_scan(
     worker: Callable[[object], Tuple[List[Dict], Optional[str]]],
     items: List[object],
     concurrency: int,
+    progress: Optional[ProgressCallback] = None,
 ) -> List[Dict]:
     """Run worker(item) concurrently.
 
     worker returns (results, error_message_or_None). If every item fails, the
     first error is raised as ScanError; if only some fail, a warning is logged
-    and the partial results are returned.
+    and the partial results are returned. progress(done, total) is called as
+    each item completes.
     """
     results: List[Dict] = []
     errors: List[str] = []
-    workers = max(1, min(int(concurrency), len(items) or 1))
+    total = len(items)
+    workers = max(1, min(int(concurrency), total or 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(worker, item) for item in items]
-        for future in as_completed(futures):
+        for done, future in enumerate(as_completed(futures), start=1):
             batch, error = future.result()
             results.extend(batch)
             if error:
                 errors.append(error)
+            if progress:
+                progress(done, total)
     if errors and not results:
         raise ScanError(errors[0])
     if errors:
@@ -81,18 +158,21 @@ def _stream_scan(
     worker: Callable[[object], Tuple[List[Dict], Optional[str]]],
     items: List[object],
     concurrency: int,
+    progress: Optional[ProgressCallback] = None,
 ) -> Iterable[Dict]:
     """Run worker(item) concurrently, yielding each result as it arrives.
 
     Yields entries in completion order (unordered). Raises ScanError if every
-    item failed and nothing was yielded.
+    item failed and nothing was yielded. progress(done, total) is called as
+    each item completes.
     """
     errors: List[str] = []
     yielded_any = False
-    workers = max(1, min(int(concurrency), len(items) or 1))
+    total = len(items)
+    workers = max(1, min(int(concurrency), total or 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(worker, item) for item in items]
-        for future in as_completed(futures):
+        for done, future in enumerate(as_completed(futures), start=1):
             batch, error = future.result()
             if batch:
                 yielded_any = True
@@ -100,6 +180,8 @@ def _stream_scan(
                     yield entry
             if error:
                 errors.append(error)
+            if progress:
+                progress(done, total)
     if errors and not yielded_any:
         raise ScanError(errors[0])
     if errors:
@@ -114,6 +196,7 @@ def arp_scan(
     concurrency: int = 32,
     resolve: bool = False,
     vendor_db: Optional[Dict[str, str]] = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> List[Dict]:
     """Discover hosts on the local network segment via ARP requests.
 
@@ -158,7 +241,7 @@ def arp_scan(
             )
         return entries, None
 
-    results = _map_scan(worker, list(targets), concurrency)
+    results = _map_scan(worker, list(targets), concurrency, progress=progress)
     return _dedupe_and_sort(results)
 
 
@@ -168,6 +251,7 @@ def icmp_ping(
     retries: int = 1,
     concurrency: int = 32,
     resolve: bool = False,
+    progress: Optional[ProgressCallback] = None,
 ) -> List[Dict]:
     """Probe hosts with ICMP echo requests.
 
@@ -205,7 +289,7 @@ def icmp_ping(
             None,
         )
 
-    results = _map_scan(worker, list(targets), concurrency)
+    results = _map_scan(worker, list(targets), concurrency, progress=progress)
     return _dedupe_and_sort(results)
 
 
@@ -239,6 +323,7 @@ def port_scan(
     concurrency: int = 100,
     resolve: bool = False,
     stream: bool = False,
+    progress: Optional[ProgressCallback] = None,
 ) -> Iterable[Dict]:
     """Scan ports on targets using TCP connect (no privileges required).
 
@@ -274,8 +359,8 @@ def port_scan(
 
     jobs = [(ip, port) for ip in targets for port in ports]
     if stream:
-        return _stream_scan(worker, jobs, concurrency)
-    results = _map_scan(worker, jobs, concurrency)
+        return _stream_scan(worker, jobs, concurrency, progress=progress)
+    results = _map_scan(worker, jobs, concurrency, progress=progress)
     results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
     return results
 
@@ -287,17 +372,25 @@ def udp_scan(
     concurrency: int = 64,
     include_closed: bool = False,
     stream: bool = False,
+    progress: Optional[ProgressCallback] = None,
+    probes: Optional[Dict[int, bytes]] = None,
 ) -> Iterable[Dict]:
     """Scan ports on targets with a UDP datagram probe (no privileges required).
 
     UDP has no handshake, so states are inferred from ICMP errors and silence:
-      * "open"          - the service replied with data (rare without a
-                          protocol-specific probe, e.g. DNS, SNMP, NTP)
+      * "open"          - the service replied with data
       * "open|filtered" - no reply and no ICMP error within the timeout
       * "closed"        - ICMP port unreachable
       * "filtered"      - ICMP host/network unreachable or admin-prohibited
 
-    By default only open and open|filtered ports are reported; pass
+    Well-known service ports receive protocol-specific probes so a live
+    service answers and the port is reported as definitively "open" (see
+    UDP_PROBES: DNS 53, NTP 123, NetBIOS 137, SNMP 161); other ports get an
+    empty datagram and stay "open|filtered" when they do not answer.
+
+    Pass probes= to replace the built-in table entirely (e.g. a custom table
+    loaded with load_probe_db); ports missing from the table get an empty
+    datagram. By default only open and open|filtered ports are reported; pass
     include_closed=True to also list closed/filtered results. With
     stream=True, returns a generator yielding results as discovered.
     """
@@ -312,7 +405,8 @@ def udp_scan(
             # connect() is required so ICMP unreachable errors are delivered
             # to the socket (sendto/recvfrom on an unconnected socket misses them)
             sock.connect((ip, port))
-            sock.send(b"")
+            table = probes if probes is not None else UDP_PROBES
+            sock.send(table.get(port, b""))
             try:
                 sock.recvfrom(1024)
                 state = "open"
@@ -334,8 +428,8 @@ def udp_scan(
 
     jobs = [(ip, port) for ip in targets for port in ports]
     if stream:
-        return _stream_scan(worker, jobs, concurrency)
-    results = _map_scan(worker, jobs, concurrency)
+        return _stream_scan(worker, jobs, concurrency, progress=progress)
+    results = _map_scan(worker, jobs, concurrency, progress=progress)
     results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
     return results
 
@@ -353,10 +447,10 @@ def syn_scan(
     ports: Iterable[int],
     timeout: float = 2.0,
     retries: int = 1,
-    iface: Optional[str] = None,
     concurrency: int = 32,
     include_closed: bool = False,
     stream: bool = False,
+    progress: Optional[ProgressCallback] = None,
 ) -> Iterable[Dict]:
     """Half-open TCP SYN scan (-sS style) using raw sockets (requires admin/root).
 
@@ -366,6 +460,10 @@ def syn_scan(
                       connection)
       * "closed"   - RST received
       * "filtered" - no reply after retries, or an ICMP error
+
+    Open ports are OS-fingerprinted from the SYN-ACK's IP TTL and TCP window
+    size (heuristic, see osdetect.guess_os); the guess plus the raw observed
+    values are included in each result as "os", "ttl", and "window".
 
     By default only open ports are reported; pass include_closed=True to also
     list closed/filtered results. Requires raw sockets (Npcap on Windows).
@@ -378,11 +476,12 @@ def syn_scan(
     def worker(job: Tuple[str, int]) -> Tuple[List[Dict], Optional[str]]:
         ip, port = job
         try:
+            # L3 send; scapy routes via the OS routing table (the iface
+            # parameter is ignored for sr1, so it is not passed).
             reply = sr1(
                 IP(dst=ip) / TCP(dport=port, flags="S"),
                 timeout=timeout,
                 retry=max(0, retries - 1),
-                iface=iface,
                 verbose=False,
             )
         except PermissionError:
@@ -396,26 +495,37 @@ def syn_scan(
             return [], f"SYN scan failed for {ip}:{port}: {exc}"
 
         state = "filtered"
+        os_guess = ttl_obs = window_obs = None
         if reply is not None and reply.haslayer(TCP):
             flags = int(reply[TCP].flags)
             if flags & 0x12:  # SYN-ACK -> open
                 state = "open"
+                if reply.haslayer(IP):
+                    ttl_obs = int(reply[IP].ttl)
+                window_obs = int(reply[TCP].window)
+                os_guess = guess_os(ttl_obs, window_obs)
                 _send_rst(ip, port)
             elif flags & 0x04:  # RST -> closed
                 state = "closed"
         # no reply or ICMP unreachable -> filtered
 
+        entry = {
+            "ip": ip,
+            "port": port,
+            "service": _service_name(port),
+            "state": state,
+            "os": os_guess,
+            "ttl": ttl_obs,
+            "window": window_obs,
+        }
         if state in ("closed", "filtered") and not include_closed:
             return [], None
-        return (
-            [{"ip": ip, "port": port, "service": _service_name(port), "state": state}],
-            None,
-        )
+        return [entry], None
 
     jobs = [(ip, port) for ip in targets for port in ports]
     if stream:
-        return _stream_scan(worker, jobs, concurrency)
-    results = _map_scan(worker, jobs, concurrency)
+        return _stream_scan(worker, jobs, concurrency, progress=progress)
+    results = _map_scan(worker, jobs, concurrency, progress=progress)
     results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
     return results
 
@@ -430,6 +540,7 @@ def discover_hosts(
     resolve: bool = False,
     vendor_db: Optional[Dict[str, str]] = None,
     common_ports: Optional[Iterable[int]] = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> List[Dict]:
     """Discover live hosts, merging results from multiple methods by IP.
 
@@ -456,6 +567,7 @@ def discover_hosts(
                 concurrency=concurrency,
                 resolve=resolve,
                 vendor_db=vendor_db,
+                progress=progress,
             )
         elif method_name == "ping":
             entries = icmp_ping(
@@ -464,6 +576,7 @@ def discover_hosts(
                 retries=retries,
                 concurrency=concurrency,
                 resolve=resolve,
+                progress=progress,
             )
         else:  # tcp liveness probe
             ports = list(common_ports) if common_ports else COMMON_PORTS
@@ -474,7 +587,9 @@ def discover_hosts(
                     "vendor": None,
                     "hostname": resolve_hostname(entry["ip"]) if resolve else None,
                 }
-                for entry in port_scan(targets, ports, timeout=timeout, concurrency=concurrency)
+                for entry in port_scan(
+                    targets, ports, timeout=timeout, concurrency=concurrency, progress=progress
+                )
             ]
         for entry in entries:
             results.setdefault(entry["ip"], entry)

@@ -55,6 +55,32 @@ def test_arp_scan_empty(monkeypatch):
     assert arp_scan(["192.168.1.10"]) == []
 
 
+def test_arp_scan_reports_progress(monkeypatch):
+    monkeypatch.setattr(scanner, "srp", lambda *a, **k: ([], []))
+    calls = []
+    arp_scan(
+        ["192.168.1.1", "192.168.1.2", "192.168.1.3"],
+        progress=lambda done, total: calls.append((done, total)),
+    )
+    assert calls == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_port_scan_stream_reports_progress(monkeypatch):
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    calls = []
+    list(
+        port_scan(
+            ["192.168.1.10"],
+            [80, 443],
+            timeout=0.1,
+            stream=True,
+            progress=lambda done, total: calls.append((done, total)),
+        )
+    )
+    assert calls[-1] == (2, 2)
+    assert len(calls) == 2
+
+
 def test_arp_scan_sorts_by_ip(monkeypatch):
     def fake_srp(pkt, *a, **k):
         ip = pkt[scanner.ARP].pdst
@@ -209,6 +235,89 @@ def test_udp_scan_open(monkeypatch):
     ]
 
 
+def test_udp_scan_sends_protocol_probes(monkeypatch):
+    sent = []
+
+    class CaptureUDPSocket(FakeUDPSocket):
+        def send(self, data):
+            sent.append(data)
+
+    monkeypatch.setattr(socket, "socket", CaptureUDPSocket)
+    udp_scan(["192.168.1.10"], [53, 123, 137, 161, 500])
+    # Well-known ports get their protocol probe; unknown ports an empty datagram
+    assert scanner.UDP_PROBES[53] in sent
+    assert scanner.UDP_PROBES[123] in sent
+    assert scanner.UDP_PROBES[137] in sent
+    assert scanner.UDP_PROBES[161] in sent
+    assert b"" in sent
+
+
+def test_load_probe_db(tmp_path):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text('{"53": "1234ab", "161": "dead be ef"}')
+    probes = scanner.load_probe_db(str(probe_file))
+    assert probes == {53: b"\x12\x34\xab", 161: b"\xde\xad\xbe\xef"}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[1, 2, 3]",
+        '{"abc": "12"}',
+        '{"70000": "12"}',
+        '{"0": "12"}',
+        '{"53": "123"}',
+        '{"53": "zz"}',
+        '{"53": 42}',
+        '{"53": ""}',
+    ],
+)
+def test_load_probe_db_errors(tmp_path, content):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text(content)
+    with pytest.raises(ValueError):
+        scanner.load_probe_db(str(probe_file))
+
+
+def test_load_probe_db_missing_file(tmp_path):
+    with pytest.raises(OSError):
+        scanner.load_probe_db(str(tmp_path / "nope.json"))
+
+
+def test_udp_scan_uses_custom_probes_table(monkeypatch):
+    sent = []
+
+    class CaptureUDPSocket(FakeUDPSocket):
+        def send(self, data):
+            sent.append(data)
+
+    monkeypatch.setattr(socket, "socket", CaptureUDPSocket)
+    custom = {53: b"custom-dns", 500: b"custom-ike"}
+    udp_scan(["192.168.1.10"], [53, 161], probes=custom)
+    assert b"custom-dns" in sent
+    assert b"" in sent  # 161 not in the custom table -> empty datagram
+    # The built-in table is replaced, not merged, when probes= is passed
+    assert scanner.UDP_PROBES[161] not in sent
+
+
+def test_udp_scan_dns_probe_response_is_open(monkeypatch):
+    sent = []
+
+    class DnsUDPSocket(FakeUDPSocket):
+        def send(self, data):
+            sent.append(data)
+
+        def recvfrom(self, bufsize):
+            # A DNS server answering the version.bind query proves port 53 open
+            return (b"\x12\x34\x81\x80\x00\x01\x00\x01", ("192.168.1.10", 53))
+
+    monkeypatch.setattr(socket, "socket", DnsUDPSocket)
+    results = udp_scan(["192.168.1.10"], [53])
+    assert results[0]["state"] == "open"
+    assert sent == [scanner.UDP_PROBES[53]]
+
+
 def test_udp_scan_no_reply_is_open_filtered(monkeypatch):
     monkeypatch.setattr(socket, "socket", FakeUDPSocket)
     results = udp_scan(["192.168.1.10"], [53])
@@ -260,22 +369,32 @@ def test_udp_scan_sorts_by_ip_and_port(monkeypatch):
 
 
 class FakeTCPReply:
-    """Minimal stand-in for a scapy reply packet carrying TCP flags."""
+    """Minimal stand-in for a scapy reply packet with TCP flags, TTL, window."""
 
-    def __init__(self, flags):
+    def __init__(self, flags, ttl=64, window=64240):
         self._flags = flags
+        self._ttl = ttl
+        self._window = window
 
     def haslayer(self, layer):
-        return layer is scanner.TCP
+        return layer in (scanner.TCP, scanner.IP)
 
     def __getitem__(self, layer):
-        if layer is scanner.TCP:
+        if layer in (scanner.TCP, scanner.IP):
             return self
         raise KeyError(layer)
 
     @property
     def flags(self):
         return self._flags
+
+    @property
+    def ttl(self):
+        return self._ttl
+
+    @property
+    def window(self):
+        return self._window
 
 
 def test_syn_scan_open(monkeypatch):
@@ -286,9 +405,50 @@ def test_syn_scan_open(monkeypatch):
     )
     results = syn_scan(["192.168.1.10"], [80])
     assert results == [
-        {"ip": "192.168.1.10", "port": 80, "service": "http", "state": "open"}
+        {
+            "ip": "192.168.1.10",
+            "port": 80,
+            "service": "http",
+            "state": "open",
+            "os": "Linux (recent)",
+            "ttl": 64,
+            "window": 64240,
+        }
     ]
     assert len(rst_sent) == 1  # half-open connection was closed with a RST
+
+
+def test_syn_scan_fingerprints_windows(monkeypatch):
+    monkeypatch.setattr(
+        scanner, "sr1", lambda *a, **k: FakeTCPReply(0x12, ttl=128, window=64240)
+    )
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    results = syn_scan(["192.168.1.10"], [80])
+    assert results[0]["os"] == "Windows 10/11"
+    assert results[0]["ttl"] == 128
+
+
+def test_syn_scan_closed_has_no_fingerprint(monkeypatch):
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: FakeTCPReply(0x04))  # RST
+    results = syn_scan(["192.168.1.10"], [80], include_closed=True)
+    assert results[0]["state"] == "closed"
+    assert results[0]["os"] is None
+    assert results[0]["ttl"] is None
+
+
+def test_syn_scan_fingerprints_real_scapy_packet(monkeypatch):
+    from scapy.all import IP, TCP
+
+    def fake_sr1(*a, **k):
+        # A real SYN-ACK as scapy would build it from a live capture
+        return IP(ttl=128) / TCP(dport=80, flags="SA", window=64240)
+
+    monkeypatch.setattr(scanner, "sr1", fake_sr1)
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    results = syn_scan(["192.168.1.10"], [80])
+    assert results[0]["os"] == "Windows 10/11"
+    assert results[0]["ttl"] == 128
+    assert results[0]["window"] == 64240
 
 
 def test_syn_scan_closed(monkeypatch):
