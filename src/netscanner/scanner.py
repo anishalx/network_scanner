@@ -30,7 +30,7 @@ except ImportError:
     HAVE_SCAPY = False
 
 from . import vendor as vendor_mod
-from .osdetect import guess_os
+from .osdetect import guess_os, parse_tcp_options
 from .utils import LOG, normalize_mac, resolve_hostname
 
 # Used for TCP liveness probing in "all" mode and as the default port set.
@@ -40,6 +40,7 @@ COMMON_PORTS = [22, 53, 80, 443, 445, 3389, 8080]
 # service answers and the port can be reported as definitively "open"
 # instead of the ambiguous "open|filtered". Other ports get an empty
 # datagram. Payloads follow nmap's well-known probe formats.
+# (See examples/probes.json for a commented, extendable copy of this table.)
 UDP_PROBES: Dict[int, bytes] = {
     # DNS: version.bind. CHAOS TXT query
     53: b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
@@ -53,6 +54,17 @@ UDP_PROBES: Dict[int, bytes] = {
     161: b"\x30\x29\x02\x01\x01\x04\x06public\xa0\x1c\x02\x04\x01\x02\x03\x04"
          b"\x02\x01\x00\x02\x01\x00\x30\x0e\x30\x0c\x06\x08"
          b"\x2b\x06\x01\x02\x01\x01\x01\x00\x05\x00",
+    # DHCP: DHCPDISCOVER (op=1 BOOTREQUEST, htype=1 Ethernet, hlen=6,
+    # xid=0x12345678, magic cookie, option 53 = DISCOVER)
+    67: (b"\x01\x01\x06\x00\x12\x34\x56\x78"
+         + b"\x00" * 228  # secs/flags + ciaddr/yiaddr/siaddr/giaddr + chaddr + sname + file
+         + b"\x63\x82\x53\x63\x35\x01\x01\xff"),
+    # TFTP: RRQ for "test" in octet mode
+    69: b"\x00\x01test\x00octet\x00",
+    # mDNS: PTR query for _services._dns-sd._udp.local
+    5353: (b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+           b"\x09_services\x07_dns-sd\x04_udp\x05local\x00"
+           b"\x00\x0c\x00\x01"),
 }
 
 
@@ -62,8 +74,9 @@ def load_probe_db(path: str) -> Dict[int, bytes]:
     Example:
         {"53": "1234010000010000000000000776657273696f6e0462696e640000100003"}
 
-    Whitespace inside hex strings is allowed. Raises ValueError with a
-    descriptive message on malformed input.
+    Whitespace inside hex strings is allowed. Keys starting with "_" are
+    ignored so files can carry comments (e.g. "_comment"). Raises ValueError
+    with a descriptive message on malformed input.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -78,6 +91,10 @@ def load_probe_db(path: str) -> Dict[int, bytes]:
 
     probes: Dict[int, bytes] = {}
     for raw_port, raw_hex in data.items():
+        # Keys starting with "_" are treated as comments (e.g. "_comment")
+        # so probe files can be self-documenting.
+        if isinstance(raw_port, str) and raw_port.startswith("_"):
+            continue
         try:
             port = int(raw_port)
         except (TypeError, ValueError) as exc:
@@ -385,8 +402,9 @@ def udp_scan(
 
     Well-known service ports receive protocol-specific probes so a live
     service answers and the port is reported as definitively "open" (see
-    UDP_PROBES: DNS 53, NTP 123, NetBIOS 137, SNMP 161); other ports get an
-    empty datagram and stay "open|filtered" when they do not answer.
+    UDP_PROBES: DNS 53, DHCP 67, TFTP 69, NTP 123, NetBIOS 137, SNMP 161,
+    mDNS 5353); other ports get an empty datagram and stay "open|filtered"
+    when they do not answer.
 
     Pass probes= to replace the built-in table entirely (e.g. a custom table
     loaded with load_probe_db); ports missing from the table get an empty
@@ -451,6 +469,7 @@ def syn_scan(
     include_closed: bool = False,
     stream: bool = False,
     progress: Optional[ProgressCallback] = None,
+    fingerprint: bool = True,
 ) -> Iterable[Dict]:
     """Half-open TCP SYN scan (-sS style) using raw sockets (requires admin/root).
 
@@ -461,9 +480,10 @@ def syn_scan(
       * "closed"   - RST received
       * "filtered" - no reply after retries, or an ICMP error
 
-    Open ports are OS-fingerprinted from the SYN-ACK's IP TTL and TCP window
-    size (heuristic, see osdetect.guess_os); the guess plus the raw observed
-    values are included in each result as "os", "ttl", and "window".
+    Open ports are OS-fingerprinted from the SYN-ACK's IP TTL, TCP window
+    size, and TCP options (heuristic, see osdetect.guess_os); the guess plus
+    the raw observed TTL/window are included in each result as "os", "ttl",
+    and "window". Set fingerprint=False to skip the guess (--no-os).
 
     By default only open ports are reported; pass include_closed=True to also
     list closed/filtered results. Requires raw sockets (Npcap on Windows).
@@ -503,7 +523,9 @@ def syn_scan(
                 if reply.haslayer(IP):
                     ttl_obs = int(reply[IP].ttl)
                 window_obs = int(reply[TCP].window)
-                os_guess = guess_os(ttl_obs, window_obs)
+                if fingerprint:
+                    mss, wscale, sack, ts = parse_tcp_options(reply[TCP].options)
+                    os_guess = guess_os(ttl_obs, window_obs, mss, wscale, sack, ts)
                 _send_rst(ip, port)
             elif flags & 0x04:  # RST -> closed
                 state = "closed"

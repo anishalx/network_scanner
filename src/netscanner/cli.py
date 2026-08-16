@@ -188,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="With -m udp, disable built-in protocol probes (empty datagram to every port)",
     )
     parser.add_argument(
+        "--no-os",
+        dest="os_detect",
+        action="store_false",
+        default=True,
+        help="With -m syn, skip OS fingerprinting from SYN responses (faster)",
+    )
+    parser.add_argument(
         "--vendor-db",
         dest="vendor_db",
         default=None,
@@ -306,6 +313,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     include_closed=args.include_closed,
                     stream=True,
                     progress=reporter.callback,
+                    fingerprint=args.os_detect,
                 )
             else:
                 entries = port_scan(
@@ -343,6 +351,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
                     progress=reporter.callback,
+                    fingerprint=args.os_detect,
                 )
             else:
                 results = port_scan(

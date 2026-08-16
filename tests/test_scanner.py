@@ -1,5 +1,6 @@
 import errno
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -243,12 +244,15 @@ def test_udp_scan_sends_protocol_probes(monkeypatch):
             sent.append(data)
 
     monkeypatch.setattr(socket, "socket", CaptureUDPSocket)
-    udp_scan(["192.168.1.10"], [53, 123, 137, 161, 500])
+    udp_scan(["192.168.1.10"], [53, 67, 69, 123, 137, 161, 5353, 500])
     # Well-known ports get their protocol probe; unknown ports an empty datagram
     assert scanner.UDP_PROBES[53] in sent
+    assert scanner.UDP_PROBES[67] in sent
+    assert scanner.UDP_PROBES[69] in sent
     assert scanner.UDP_PROBES[123] in sent
     assert scanner.UDP_PROBES[137] in sent
     assert scanner.UDP_PROBES[161] in sent
+    assert scanner.UDP_PROBES[5353] in sent
     assert b"" in sent
 
 
@@ -257,6 +261,28 @@ def test_load_probe_db(tmp_path):
     probe_file.write_text('{"53": "1234ab", "161": "dead be ef"}')
     probes = scanner.load_probe_db(str(probe_file))
     assert probes == {53: b"\x12\x34\xab", 161: b"\xde\xad\xbe\xef"}
+
+
+def test_load_probe_db_ignores_comment_keys(tmp_path):
+    probe_file = tmp_path / "probes.json"
+    probe_file.write_text(
+        '{"_comment": "a note", "_note_dhcp": "another", "53": "1234ab"}'
+    )
+    probes = scanner.load_probe_db(str(probe_file))
+    assert probes == {53: b"\x12\x34\xab"}
+
+
+def test_examples_probes_file_loads(tmp_path):
+    """The bundled examples/probes.json must load and match the built-in table
+    for the ports it mirrors, so docs and code cannot drift apart."""
+    examples = Path(__file__).resolve().parents[1] / "examples" / "probes.json"
+    if not examples.exists():
+        pytest.skip("examples/probes.json not present")
+    probes = scanner.load_probe_db(str(examples))
+    # RDP (3389) is example-only: RDP is a TCP service, this targets its UDP transport
+    assert set(probes) == set(scanner.UDP_PROBES) | {3389}
+    for port, payload in scanner.UDP_PROBES.items():
+        assert probes[port] == payload
 
 
 @pytest.mark.parametrize(
@@ -369,12 +395,13 @@ def test_udp_scan_sorts_by_ip_and_port(monkeypatch):
 
 
 class FakeTCPReply:
-    """Minimal stand-in for a scapy reply packet with TCP flags, TTL, window."""
+    """Minimal stand-in for a scapy reply packet with TCP flags, TTL, window, options."""
 
-    def __init__(self, flags, ttl=64, window=64240):
+    def __init__(self, flags, ttl=64, window=64240, options=None):
         self._flags = flags
         self._ttl = ttl
         self._window = window
+        self._options = options if options is not None else []
 
     def haslayer(self, layer):
         return layer in (scanner.TCP, scanner.IP)
@@ -395,6 +422,10 @@ class FakeTCPReply:
     @property
     def window(self):
         return self._window
+
+    @property
+    def options(self):
+        return self._options
 
 
 def test_syn_scan_open(monkeypatch):
@@ -426,6 +457,36 @@ def test_syn_scan_fingerprints_windows(monkeypatch):
     results = syn_scan(["192.168.1.10"], [80])
     assert results[0]["os"] == "Windows 10/11"
     assert results[0]["ttl"] == 128
+
+
+def test_syn_scan_sharpened_fingerprint_with_options(monkeypatch):
+    # macOS shares Linux's TTL/window (64/65535); wscale 3 disambiguates it
+    macos_options = [
+        ("MSS", 1460),
+        ("NOP", None),
+        ("WScale", 3),
+        ("SAckOK", b""),
+        ("Timestamp", (1000, 0)),
+    ]
+    monkeypatch.setattr(
+        scanner,
+        "sr1",
+        lambda *a, **k: FakeTCPReply(0x12, ttl=64, window=65535, options=macos_options),
+    )
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    results = syn_scan(["192.168.1.10"], [80])
+    assert results[0]["os"] == "macOS"
+
+
+def test_syn_scan_no_fingerprint_flag(monkeypatch):
+    monkeypatch.setattr(
+        scanner, "sr1", lambda *a, **k: FakeTCPReply(0x12, ttl=64, window=64240)
+    )
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    results = syn_scan(["192.168.1.10"], [80], fingerprint=False)
+    assert results[0]["os"] is None
+    assert results[0]["ttl"] == 64  # observed values still recorded
+    assert results[0]["window"] == 64240
 
 
 def test_syn_scan_closed_has_no_fingerprint(monkeypatch):

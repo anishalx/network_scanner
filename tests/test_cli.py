@@ -136,6 +136,23 @@ def test_syn_jsonl_stream(monkeypatch, capsys):
     assert json.loads(out.splitlines()[0]) == FAKE_PORTS[0]
 
 
+def test_no_os_flag_passed_to_syn_scan(monkeypatch):
+    captured = {}
+
+    def fake_syn_scan(*a, **k):
+        captured["fingerprint"] = k.get("fingerprint")
+        return []
+
+    monkeypatch.setattr(cli, "syn_scan", fake_syn_scan)
+    code = cli.main(["-t", "192.168.1.10", "-m", "syn", "-p", "80", "--no-os"])
+    assert code == 0
+    assert captured["fingerprint"] is False
+
+    code = cli.main(["-t", "192.168.1.10", "-m", "syn", "-p", "80"])
+    assert code == 0
+    assert captured["fingerprint"] is True
+
+
 def test_syn_scan_table_includes_os_column(monkeypatch, capsys):
     fake = [
         {

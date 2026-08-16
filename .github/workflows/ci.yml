@@ -23,3 +23,48 @@ jobs:
           pip install -e ".[dev]"
       - name: Run tests
         run: pytest -v
+
+  build:
+    name: Wheel build + installed console script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure no setup.py (pyproject-only build)
+        run: |
+          test ! -f setup.py
+          test ! -f setup.cfg
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip
+          pip install "build>=1.0"
+          python -m build
+          ls -la dist/
+
+      - name: Verify wheel bundles the OUI database
+        run: |
+          python - <<'EOF'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          with zipfile.ZipFile(wheel) as z:
+              names = z.namelist()
+          assert any(n.endswith("data/oui.csv.gz") for n in names), \
+              f"wheel missing data/oui.csv.gz; has {names}"
+          print("wheel contains data/oui.csv.gz:", wheel)
+          EOF
+
+      - name: Install wheel into a clean venv (non-editable)
+        run: |
+          python -m venv /tmp/ns-venv
+          /tmp/ns-venv/bin/pip install --upgrade pip
+          /tmp/ns-venv/bin/pip install dist/*.whl
+
+      - name: Smoke-test the installed console script
+        run: |
+          /tmp/ns-venv/bin/netscanner --version
+          /tmp/ns-venv/bin/python -c "from netscanner.vendor import lookup_vendor; assert lookup_vendor('b8:27:eb') == 'Raspberry Pi Foundation'"
+          /tmp/ns-venv/bin/netscanner -t 127.0.0.1 -m tcp -p 1-100 --timeout 0.2 -f json -q | /tmp/ns-venv/bin/python -c "import json,sys; data=json.load(sys.stdin); print(f'console script scan OK: {len(data)} result(s)')"

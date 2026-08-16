@@ -1,0 +1,20 @@
+{
+  "_comment": "Custom UDP probe table for 'netscanner -m udp --probes probes.json'. Keys are port numbers, values are hex payloads. Keys starting with '_' are ignored as comments. Ports defined here REPLACE the built-in probe for the same port (other built-ins still apply); combine with --no-probes to use ONLY this table. Hex strings may contain whitespace for readability.",
+  "_note_dhcp": "DHCPDISCOVER (op=1 BOOTREQUEST, htype=1 Ethernet, xid=0x12345678, magic cookie, option 53 = DISCOVER).",
+  "67": "010106001234567800000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000000000000 000000000000000000000000000000000000000063825363 350101ff",
+  "_note_tftp": "TFTP RRQ for 'test' in octet mode.",
+  "69": "0001 74657374 00 6f63746574 00",
+  "_note_rdp": "RDP is primarily a TCP service (port 3389/tcp); this targets the RDP UDP transport used by newer Windows for multimedia redirection. TPKT/X.224 Connection Request.",
+  "3389": "03000013 0ee0 000000000100080003000000",
+  "_note_mdns": "mDNS PTR query for _services._dns-sd._udp.local.",
+  "5353": "0000 0000 0001 0000 0000 0000 09 5f7365727669636573 07 5f646e732d7364 04 5f756470 05 6c6f63616c 00 000c 0001",
+  "_note_builtins": "The built-in probes below are included for reference; they are already active without a --probes file.",
+  "_builtin_dns": "DNS version.bind CHAOS TXT query.",
+  "53": "1234010000010000000000000776657273696f6e0462696e640000100003",
+  "_builtin_ntp": "NTP v3 client request (48 bytes).",
+  "123": "1b0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "_builtin_netbios": "NetBIOS NBSTAT name service query.",
+  "137": "80f00010000100000000000020434b4141414141414141414141414141414141414141414141414141414141410000210001",
+  "_builtin_snmp": "SNMP v1 GET for sysDescr.0, community 'public'.",
+  "161": "302902010104067075626c6963a01c020401020304020100020100300e300c06082b060102010101000500"
+}

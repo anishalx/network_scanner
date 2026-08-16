@@ -31,8 +31,8 @@
   - `arp` — Layer-2 host discovery on your local segment (IP + MAC + vendor)
   - `ping` — ICMP echo sweep
   - `tcp` — privilege-free TCP connect port scan (works without admin/root)
-  - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`); sends protocol probes to well-known service ports (DNS 53, NTP 123, NetBIOS 137, SNMP 161) so live services report definitively `open`
-  - `syn` — half-open TCP SYN scan (needs admin/root; stealthier — the target never sees an established connection)
+  - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`); sends protocol probes to well-known service ports (DNS 53, DHCP 67, TFTP 69, NTP 123, NetBIOS 137, SNMP 161, mDNS 5353) so live services report definitively `open`
+  - `syn` — half-open TCP SYN scan (needs admin/root; stealthier — the target never sees an established connection); open ports are OS-fingerprinted from the SYN-ACK's TTL + TCP window + TCP options (MSS/WScale/SACK/timestamps; heuristic, disable with `--no-os`)
   - `all` — runs ARP and ICMP, degrading gracefully if either needs privileges; if nothing is found, falls back to a TCP scan of common ports
 - **Flexible targets**: single IP, CIDR (`192.168.1.0/24`), hyphen ranges (`192.168.1.1-50`), hostnames, and comma-separated combinations
 - **MAC vendor lookup**: the full IEEE OUI database (~40k vendors) is bundled with the tool, layered under friendly curated names, plus custom `--vendor-db` overrides
@@ -92,7 +92,8 @@ netscanner -t 192.168.1.5 -m tcp -p 22,80,443,8000-9000
 # UDP scan (DNS, SNMP, NTP...); closed ports shown with --include-closed
 netscanner -t 192.168.1.5 -m udp -p 53,161,500 --include-closed
 
-# Stealthy half-open SYN scan (needs admin/root; Npcap on Windows)
+# Stealthy half-open SYN scan (needs admin/root; Npcap on Windows);
+# open ports include a heuristic OS guess from TTL + TCP window
 netscanner -t 192.168.1.5 -m syn -p 1-1000 --include-closed
 
 # Machine-readable output to a file
@@ -133,6 +134,7 @@ IP Address    MAC Address       Vendor                  Hostname
     --include-closed  With -m udp / -m syn, also list closed/filtered ports
     --probes FILE     Custom UDP probe file (JSON: port -> hex payload); -m udp
     --no-probes       With -m udp, disable built-in protocol probes
+    --no-os           With -m syn, skip OS fingerprinting (faster)
 -f, --format          table | json | csv | jsonl   (default: table)
                       jsonl streams port-scan results as they are discovered
 -o, --output FILE     Write results to a file
@@ -172,7 +174,7 @@ All tests mock network access, so they run anywhere — no root or Npcap needed.
 | `ICMP ping requires administrator/root privileges` | Run as root/admin, or use `-m tcp` |
 | `SYN scan failed ... raw sockets unavailable` | SYN scanning needs admin/root (and Npcap on Windows); use `-m tcp` for an unprivileged equivalent |
 | `No devices found` | Try `-m ping` or `-m tcp`; the auto `all` mode does this for you |
-| UDP shows only `open|filtered` | Expected for ports that don't answer empty datagrams. Known service ports (53 DNS, 123 NTP, 137 NetBIOS, 161 SNMP) receive protocol probes automatically and report `open` when a live service answers; other ports report `open|filtered` when they stay silent |
+| UDP shows only `open|filtered` | Expected for ports that don't answer empty datagrams. Known service ports (53 DNS, 67 DHCP, 69 TFTP, 123 NTP, 137 NetBIOS, 161 SNMP, 5353 mDNS) receive protocol probes automatically and report `open` when a live service answers; other ports report `open|filtered` when they stay silent |
 | `Invalid target(s)` | Use IPv4, e.g. `192.168.1.0/24`, `192.168.1.1-50`, or a resolvable hostname |
 | Unknown MAC vendors | Refresh the bundled database: `python tools/update_oui_db.py`, or supply your own `--vendor-db` CSV |
 
@@ -188,15 +190,20 @@ We welcome contributions! Please:
 
 ### Custom UDP probes
 
-Well-known UDP service ports get protocol probes automatically (DNS 53, NTP 123, NetBIOS 137, SNMP 161). You can extend or override them with a JSON file mapping ports to hex payloads:
-
-```json
-{"53": "1234010000010000000000000776657273696f6e0462696e640000100003"}
-```
+Well-known UDP service ports get protocol probes automatically (DNS 53, DHCP 67, TFTP 69, NTP 123, NetBIOS 137, SNMP 161, mDNS 5353). You can extend or override them with a JSON file mapping ports to hex payloads — a commented, ready-to-use example covering DHCP, TFTP, RDP (UDP transport) and mDNS ships at [`examples/probes.json`](examples/probes.json):
 
 ```bash
-netscanner -t 192.168.1.5 -m udp -p 53,500 --probes probes.json
-netscanner -t 192.168.1.5 -m udp -p 53 --no-probes        # disable all probes
+netscanner -t 192.168.1.5 -m udp -p 67,69,5353 --probes examples/probes.json
+netscanner -t 192.168.1.5 -m udp -p 53 --no-probes          # disable all probes
+```
+
+Keys in the file are port numbers, values are hex payloads; keys starting with `_` are ignored as comments and hex may contain whitespace, so files can be self-documenting:
+
+```json
+{
+  "_comment": "DHCPDISCOVER for port 67",
+  "67": "01010600 12345678 00000000000000000000000000000000 ... 63825363 350101 ff"
+}
 ```
 
 `--no-probes` disables the built-in table; `--probes FILE` entries override the built-ins for the same ports (use both to replace the table entirely).
