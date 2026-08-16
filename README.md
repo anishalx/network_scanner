@@ -27,11 +27,12 @@
 
 ## Features (v2)
 
-- **Four scan methods** (`arp`, `ping`, `tcp`, `udp`) plus automatic `all` mode:
+- **Five scan methods** (`arp`, `ping`, `tcp`, `udp`, `syn`) plus automatic `all` mode:
   - `arp` — Layer-2 host discovery on your local segment (IP + MAC + vendor)
   - `ping` — ICMP echo sweep
   - `tcp` — privilege-free TCP connect port scan (works without admin/root)
   - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`)
+  - `syn` — half-open TCP SYN scan (needs admin/root; stealthier — the target never sees an established connection)
   - `all` — runs ARP and ICMP, degrading gracefully if either needs privileges; if nothing is found, falls back to a TCP scan of common ports
 - **Flexible targets**: single IP, CIDR (`192.168.1.0/24`), hyphen ranges (`192.168.1.1-50`), hostnames, and comma-separated combinations
 - **MAC vendor lookup**: the full IEEE OUI database (~40k vendors) is bundled with the tool, layered under friendly curated names, plus custom `--vendor-db` overrides
@@ -90,6 +91,9 @@ netscanner -t 192.168.1.5 -m tcp -p 22,80,443,8000-9000
 # UDP scan (DNS, SNMP, NTP...); closed ports shown with --include-closed
 netscanner -t 192.168.1.5 -m udp -p 53,161,500 --include-closed
 
+# Stealthy half-open SYN scan (needs admin/root; Npcap on Windows)
+netscanner -t 192.168.1.5 -m syn -p 1-1000 --include-closed
+
 # Machine-readable output to a file
 netscanner -t 192.168.1.0/24 -f json -o scan.json
 netscanner -t 192.168.1.0/24 -f csv -o scan.csv
@@ -123,9 +127,9 @@ IP Address    MAC Address       Vendor                  Hostname
 
 ```
 -t, --target TARGET   IP, CIDR range, hyphen range, hostname, or comma list
--m, --method          arp | ping | tcp | udp | all   (default: all)
--p, --ports PORTS     Ports for -m tcp / -m udp: '22', '80,443', '1-1000'
-    --include-closed  With -m udp, also list closed/filtered ports
+-m, --method          arp | ping | tcp | udp | syn | all   (default: all)
+-p, --ports PORTS     Ports for -m tcp / -m udp / -m syn: '22', '80,443', '1-1000'
+    --include-closed  With -m udp / -m syn, also list closed/filtered ports
 -f, --format          table | json | csv | jsonl   (default: table)
                       jsonl streams port-scan results as they are discovered
 -o, --output FILE     Write results to a file
@@ -163,6 +167,7 @@ All tests mock network access, so they run anywhere — no root or Npcap needed.
 | --- | --- |
 | `ARP scan failed ... winpcap is not installed` | Install [Npcap](https://npcap.com/) and run as administrator |
 | `ICMP ping requires administrator/root privileges` | Run as root/admin, or use `-m tcp` |
+| `SYN scan failed ... raw sockets unavailable` | SYN scanning needs admin/root (and Npcap on Windows); use `-m tcp` for an unprivileged equivalent |
 | `No devices found` | Try `-m ping` or `-m tcp`; the auto `all` mode does this for you |
 | UDP shows only `open|filtered` | Normal — most UDP services only reply to protocol-specific probes (DNS/SNMP/NTP queries); `open|filtered` means no reply and no ICMP error |
 | `Invalid target(s)` | Use IPv4, e.g. `192.168.1.0/24`, `192.168.1.1-50`, or a resolvable hostname |

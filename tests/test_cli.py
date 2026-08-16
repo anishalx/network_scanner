@@ -120,6 +120,22 @@ def test_udp_scan_flow(monkeypatch, capsys):
     assert "open|filtered" in out
 
 
+def test_syn_scan_flow(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "syn_scan", lambda *a, **k: FAKE_PORTS)
+    code = cli.main(["-t", "192.168.1.10", "-m", "syn", "-p", "80"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "http" in out
+
+
+def test_syn_jsonl_stream(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "syn_scan", lambda *a, **k: iter(FAKE_PORTS))
+    code = cli.main(["-t", "192.168.1.10", "-m", "syn", "-p", "80", "-f", "jsonl"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert json.loads(out.splitlines()[0]) == FAKE_PORTS[0]
+
+
 def test_udp_include_closed_flag_passed(monkeypatch, capsys):
     captured = {}
 

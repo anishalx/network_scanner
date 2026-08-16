@@ -18,7 +18,7 @@ from .output import (
     format_table,
     write_output,
 )
-from .scanner import COMMON_PORTS, ScanError, discover_hosts, port_scan, udp_scan
+from .scanner import COMMON_PORTS, ScanError, discover_hosts, port_scan, syn_scan, udp_scan
 from .target import TargetError, parse_ports, parse_targets
 from .utils import colorize, is_admin, setup_logging
 from .vendor import load_vendor_db
@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  netscanner -t 192.168.1.0/24 -m ping             # ICMP sweep\n"
             "  netscanner -t 192.168.1.5 -m tcp -p 1-1000       # TCP port scan (no privileges needed)\n"
             "  netscanner -t 192.168.1.5 -m udp -p 53,161,500    # UDP scan (open/open|filtered)\n"
+            "  netscanner -t 192.168.1.5 -m syn -p 1-1000         # stealthy SYN scan (needs admin/root)\n"
             "  netscanner -t 192.168.1.1-50 -f json -o out.json # JSON to file\n"
             "  netscanner -t 192.168.1.5 -m tcp -p 1-65535 -f jsonl -o scan.jsonl\n"
             "                                            # streams one JSON object per line\n"
@@ -83,9 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-m",
         "--method",
         dest="method",
-        choices=["arp", "ping", "tcp", "udp", "all"],
+        choices=["arp", "ping", "tcp", "udp", "syn", "all"],
         default="all",
-        help="Scan method: arp, ping, tcp, udp, all (default: all)",
+        help="Scan method: arp, ping, tcp, udp, syn, all (default: all)",
     )
     parser.add_argument(
         "-p",
@@ -156,8 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="include_closed",
         action="store_true",
         help=(
-            "With -m udp, also report closed/filtered ports "
-            "(default: open and open|filtered only)"
+            "With -m udp / -m syn, also report closed/filtered ports "
+            "(default: open only)"
         ),
     )
     parser.add_argument(
@@ -207,13 +208,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"ERROR: could not load vendor database: {exc}", file=sys.stderr)
             return 1
 
-    is_port_scan = args.method in ("tcp", "udp") or args.ports is not None
-    if is_port_scan and args.method not in ("tcp", "udp"):
+    is_port_scan = args.method in ("tcp", "udp", "syn") or args.ports is not None
+    if is_port_scan and args.method not in ("tcp", "udp", "syn"):
         LOG.info("Ports were specified; performing a TCP port scan")
 
     if not is_port_scan and not is_admin():
         LOG.warning(
-            "ARP/ICMP scans require administrator/root privileges on most systems; "
+            "ARP/ICMP/SYN scans require administrator/root privileges on most systems; "
             "use -m tcp if you lack them."
         )
 
@@ -241,6 +242,17 @@ def main(argv: Optional[List[str]] = None) -> int:
                     include_closed=args.include_closed,
                     stream=True,
                 )
+            elif args.method == "syn":
+                entries = syn_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    iface=args.iface,
+                    concurrency=args.concurrency,
+                    include_closed=args.include_closed,
+                    stream=True,
+                )
             else:
                 entries = port_scan(
                     targets,
@@ -262,6 +274,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                     targets,
                     ports,
                     timeout=args.timeout,
+                    concurrency=args.concurrency,
+                    include_closed=args.include_closed,
+                )
+            elif args.method == "syn":
+                results = syn_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    iface=args.iface,
                     concurrency=args.concurrency,
                     include_closed=args.include_closed,
                 )

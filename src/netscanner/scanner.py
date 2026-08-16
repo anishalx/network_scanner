@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
-    from scapy.all import ARP, Ether, ICMP, IP, sr1, srp  # noqa: F401
+    from scapy.all import ARP, Ether, ICMP, IP, TCP, send, sr1, srp  # noqa: F401
     from scapy.error import Scapy_Exception
 
     HAVE_SCAPY = True
@@ -324,6 +324,86 @@ def udp_scan(
             return [], None  # could not reach the host at all
         finally:
             sock.close()
+
+        if state in ("closed", "filtered") and not include_closed:
+            return [], None
+        return (
+            [{"ip": ip, "port": port, "service": _service_name(port), "state": state}],
+            None,
+        )
+
+    jobs = [(ip, port) for ip in targets for port in ports]
+    if stream:
+        return _stream_scan(worker, jobs, concurrency)
+    results = _map_scan(worker, jobs, concurrency)
+    results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
+    return results
+
+
+def _send_rst(ip: str, port: int) -> None:
+    """Best-effort RST to close a half-open TCP connection; never raises."""
+    try:
+        send(IP(dst=ip) / TCP(dport=port, flags="R"), verbose=False)
+    except (OSError, RuntimeError, Scapy_Exception):
+        pass
+
+
+def syn_scan(
+    targets: Iterable[str],
+    ports: Iterable[int],
+    timeout: float = 2.0,
+    retries: int = 1,
+    iface: Optional[str] = None,
+    concurrency: int = 32,
+    include_closed: bool = False,
+    stream: bool = False,
+) -> Iterable[Dict]:
+    """Half-open TCP SYN scan (-sS style) using raw sockets (requires admin/root).
+
+    Sends a SYN and infers the state from the reply without completing the
+    handshake, so the target application never sees an established connection:
+      * "open"     - SYN-ACK received (a RST is sent to close the half-open
+                      connection)
+      * "closed"   - RST received
+      * "filtered" - no reply after retries, or an ICMP error
+
+    By default only open ports are reported; pass include_closed=True to also
+    list closed/filtered results. Requires raw sockets (Npcap on Windows).
+    With stream=True, returns a generator yielding results as discovered.
+    """
+    _require_scapy()
+    targets = [str(t) for t in targets]
+    ports = list(ports)
+
+    def worker(job: Tuple[str, int]) -> Tuple[List[Dict], Optional[str]]:
+        ip, port = job
+        try:
+            reply = sr1(
+                IP(dst=ip) / TCP(dport=port, flags="S"),
+                timeout=timeout,
+                retry=max(0, retries - 1),
+                iface=iface,
+                verbose=False,
+            )
+        except PermissionError:
+            return [], "SYN scanning requires administrator/root privileges."
+        except (OSError, RuntimeError, Scapy_Exception) as exc:
+            return [], (
+                "SYN scan failed (raw sockets unavailable; on Windows install "
+                f"Npcap and run as administrator): {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001 - surface platform quirks cleanly
+            return [], f"SYN scan failed for {ip}:{port}: {exc}"
+
+        state = "filtered"
+        if reply is not None and reply.haslayer(TCP):
+            flags = int(reply[TCP].flags)
+            if flags & 0x12:  # SYN-ACK -> open
+                state = "open"
+                _send_rst(ip, port)
+            elif flags & 0x04:  # RST -> closed
+                state = "closed"
+        # no reply or ICMP unreachable -> filtered
 
         if state in ("closed", "filtered") and not include_closed:
             return [], None

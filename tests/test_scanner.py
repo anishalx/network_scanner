@@ -10,6 +10,7 @@ from netscanner.scanner import (
     discover_hosts,
     icmp_ping,
     port_scan,
+    syn_scan,
     udp_scan,
 )
 
@@ -253,6 +254,81 @@ def test_udp_scan_sorts_by_ip_and_port(monkeypatch):
     monkeypatch.setattr(socket, "socket", FakeUDPSocket)
     results = udp_scan(["192.168.1.10"], [80, 53])
     assert [r["port"] for r in results] == [53, 80]
+
+
+# --- SYN ---
+
+
+class FakeTCPReply:
+    """Minimal stand-in for a scapy reply packet carrying TCP flags."""
+
+    def __init__(self, flags):
+        self._flags = flags
+
+    def haslayer(self, layer):
+        return layer is scanner.TCP
+
+    def __getitem__(self, layer):
+        if layer is scanner.TCP:
+            return self
+        raise KeyError(layer)
+
+    @property
+    def flags(self):
+        return self._flags
+
+
+def test_syn_scan_open(monkeypatch):
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: FakeTCPReply(0x12))  # SYN-ACK
+    rst_sent = []
+    monkeypatch.setattr(
+        scanner, "send", lambda *a, **k: rst_sent.append(a) or None
+    )
+    results = syn_scan(["192.168.1.10"], [80])
+    assert results == [
+        {"ip": "192.168.1.10", "port": 80, "service": "http", "state": "open"}
+    ]
+    assert len(rst_sent) == 1  # half-open connection was closed with a RST
+
+
+def test_syn_scan_closed(monkeypatch):
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: FakeTCPReply(0x04))  # RST
+    assert syn_scan(["192.168.1.10"], [80]) == []
+    results = syn_scan(["192.168.1.10"], [80], include_closed=True)
+    assert results[0]["state"] == "closed"
+
+
+def test_syn_scan_filtered_no_reply(monkeypatch):
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: None)
+    assert syn_scan(["192.168.1.10"], [80]) == []
+    results = syn_scan(["192.168.1.10"], [80], include_closed=True)
+    assert results[0]["state"] == "filtered"
+
+
+def test_syn_scan_privilege_error(monkeypatch):
+    def boom(*a, **k):
+        raise PermissionError()
+
+    monkeypatch.setattr(scanner, "sr1", boom)
+    with pytest.raises(ScanError, match="administrator/root"):
+        syn_scan(["192.168.1.10"], [80])
+
+
+def test_syn_scan_stream(monkeypatch):
+    import types
+
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: FakeTCPReply(0x12))
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    gen = syn_scan(["192.168.1.10"], [80], stream=True)
+    assert isinstance(gen, types.GeneratorType)
+    assert [r["port"] for r in gen] == [80]
+
+
+def test_syn_scan_sorts_by_ip_and_port(monkeypatch):
+    monkeypatch.setattr(scanner, "sr1", lambda *a, **k: FakeTCPReply(0x12))
+    monkeypatch.setattr(scanner, "send", lambda *a, **k: None)
+    results = syn_scan(["192.168.1.10"], [443, 80])
+    assert [r["port"] for r in results] == [80, 443]
 
 
 # --- discover_hosts ---

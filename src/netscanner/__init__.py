@@ -5,6 +5,7 @@ Methods:
   * ping - Layer-3 ICMP echo sweep (requires raw sockets / admin on most OSes)
   * tcp  - Privilege-free TCP connect port scan
   * udp  - Privilege-free UDP datagram scan (open / open|filtered detection)
+  * syn  - Half-open TCP SYN scan (requires admin/root; stealthier than tcp)
   * all  - Auto: ARP -> ICMP -> TCP common-port fallback
 """
 
