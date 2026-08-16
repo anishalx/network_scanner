@@ -92,6 +92,15 @@ def test_jsonl_empty_port_scan_prints_message_to_stderr(monkeypatch, capsys):
     assert "No open ports found" in captured.err
 
 
+def test_jsonl_empty_port_scan_quiet_suppresses_stderr_note(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "port_scan", lambda *a, **k: iter([]))
+    code = cli.main(["-t", "192.168.1.10", "-m", "tcp", "-p", "80", "-f", "jsonl", "-q"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""  # -q silences the "no results" note too
+
+
 def test_port_scan_flow(monkeypatch, capsys):
     monkeypatch.setattr(cli, "port_scan", lambda *a, **k: FAKE_PORTS)
     code = cli.main(["-t", "192.168.1.10", "-m", "tcp", "-p", "80"])

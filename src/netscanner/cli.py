@@ -328,7 +328,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         except ScanError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        return _stream_jsonl(entries, args.output)
+        return _stream_jsonl(entries, args.output, quiet=args.quiet)
 
     try:
         if is_port_scan:
@@ -411,12 +411,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
-def _stream_jsonl(entries: Iterable[dict], path: Optional[str]) -> int:
+def _stream_jsonl(entries: Iterable[dict], path: Optional[str], quiet: bool = False) -> int:
     """Emit scan entries as JSON Lines, streaming to stdout or a file.
 
     With a path, results are written progressively to the file (tailable while
     the scan runs) and a summary goes to stdout. Without one, each line goes
     to stdout and any messages go to stderr so the stream stays pure JSONL.
+    The "no results" note is suppressed with quiet.
     """
     count = 0
     try:
@@ -430,7 +431,7 @@ def _stream_jsonl(entries: Iterable[dict], path: Optional[str]) -> int:
             for entry in entries:
                 print(json.dumps(entry))
                 count += 1
-            if count == 0:
+            if count == 0 and not quiet:
                 print("No open ports found.", file=sys.stderr)
     except ScanError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
