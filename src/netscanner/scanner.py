@@ -1,12 +1,13 @@
-"""Scanning backends: ARP host discovery, ICMP ping sweep, and TCP port scan.
+"""Scanning backends: ARP host discovery, ICMP ping sweep, and TCP/UDP port scans.
 
 All workers run concurrently (ThreadPoolExecutor). Scapy is imported lazily at
-module load with a graceful fallback so the CLI can still run TCP scans and
+module load with a graceful fallback so the CLI can still run TCP/UDP scans and
 report clear errors when the library is missing.
 """
 
 from __future__ import annotations
 
+import errno
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
@@ -74,6 +75,35 @@ def _map_scan(
     if errors:
         LOG.warning("%d probe(s) failed: %s", len(errors), errors[0])
     return results
+
+
+def _stream_scan(
+    worker: Callable[[object], Tuple[List[Dict], Optional[str]]],
+    items: List[object],
+    concurrency: int,
+) -> Iterable[Dict]:
+    """Run worker(item) concurrently, yielding each result as it arrives.
+
+    Yields entries in completion order (unordered). Raises ScanError if every
+    item failed and nothing was yielded.
+    """
+    errors: List[str] = []
+    yielded_any = False
+    workers = max(1, min(int(concurrency), len(items) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(worker, item) for item in items]
+        for future in as_completed(futures):
+            batch, error = future.result()
+            if batch:
+                yielded_any = True
+                for entry in batch:
+                    yield entry
+            if error:
+                errors.append(error)
+    if errors and not yielded_any:
+        raise ScanError(errors[0])
+    if errors:
+        LOG.warning("%d probe(s) failed: %s", len(errors), errors[0])
 
 
 def arp_scan(
@@ -186,16 +216,35 @@ def _service_name(port: int) -> Optional[str]:
         return None
 
 
+def _udp_state_from_error(exc: OSError) -> str:
+    """Map the OS error raised by a UDP probe to an nmap-style state.
+
+    Closed ports surface as ICMP port-unreachable, which Python reports as
+    ConnectionRefusedError (POSIX ECONNREFUSED) or ConnectionResetError
+    (Windows WSAECONNRESET). Host/network unreachable means filtered.
+    """
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError)):
+        return "closed"
+    if exc.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN):
+        return "filtered"
+    if exc.errno == errno.ETIMEDOUT:
+        return "open|filtered"
+    return "filtered"
+
+
 def port_scan(
     targets: Iterable[str],
     ports: Iterable[int],
     timeout: float = 1.0,
     concurrency: int = 100,
     resolve: bool = False,
-) -> List[Dict]:
+    stream: bool = False,
+) -> Iterable[Dict]:
     """Scan ports on targets using TCP connect (no privileges required).
 
-    Each result: {"ip", "port", "service", "state": "open"}.
+    Each result: {"ip", "port", "service", "state": "open"}. With
+    stream=True, returns a generator yielding results as they are discovered
+    (completion order) instead of a sorted list - useful for very large scans.
     """
     targets = [str(t) for t in targets]
     ports = list(ports)
@@ -224,6 +273,68 @@ def port_scan(
             sock.close()
 
     jobs = [(ip, port) for ip in targets for port in ports]
+    if stream:
+        return _stream_scan(worker, jobs, concurrency)
+    results = _map_scan(worker, jobs, concurrency)
+    results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
+    return results
+
+
+def udp_scan(
+    targets: Iterable[str],
+    ports: Iterable[int],
+    timeout: float = 2.0,
+    concurrency: int = 64,
+    include_closed: bool = False,
+    stream: bool = False,
+) -> Iterable[Dict]:
+    """Scan ports on targets with a UDP datagram probe (no privileges required).
+
+    UDP has no handshake, so states are inferred from ICMP errors and silence:
+      * "open"          - the service replied with data (rare without a
+                          protocol-specific probe, e.g. DNS, SNMP, NTP)
+      * "open|filtered" - no reply and no ICMP error within the timeout
+      * "closed"        - ICMP port unreachable
+      * "filtered"      - ICMP host/network unreachable or admin-prohibited
+
+    By default only open and open|filtered ports are reported; pass
+    include_closed=True to also list closed/filtered results. With
+    stream=True, returns a generator yielding results as discovered.
+    """
+    targets = [str(t) for t in targets]
+    ports = list(ports)
+
+    def worker(job: Tuple[str, int]) -> Tuple[List[Dict], Optional[str]]:
+        ip, port = job
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            # connect() is required so ICMP unreachable errors are delivered
+            # to the socket (sendto/recvfrom on an unconnected socket misses them)
+            sock.connect((ip, port))
+            sock.send(b"")
+            try:
+                sock.recvfrom(1024)
+                state = "open"
+            except socket.timeout:
+                state = "open|filtered"
+            except OSError as exc:
+                state = _udp_state_from_error(exc)
+        except OSError:
+            return [], None  # could not reach the host at all
+        finally:
+            sock.close()
+
+        if state in ("closed", "filtered") and not include_closed:
+            return [], None
+        return (
+            [{"ip": ip, "port": port, "service": _service_name(port), "state": state}],
+            None,
+        )
+
+    jobs = [(ip, port) for ip in targets for port in ports]
+    if stream:
+        return _stream_scan(worker, jobs, concurrency)
     results = _map_scan(worker, jobs, concurrency)
     results.sort(key=lambda r: (_ip_key(r["ip"]), r["port"]))
     return results

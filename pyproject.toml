@@ -29,6 +29,9 @@ netscanner = "netscanner.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+netscanner = ["data/*.csv.gz"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

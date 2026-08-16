@@ -1,9 +1,17 @@
+import errno
 import socket
 
 import pytest
 
 from netscanner import scanner
-from netscanner.scanner import ScanError, arp_scan, discover_hosts, icmp_ping, port_scan
+from netscanner.scanner import (
+    ScanError,
+    arp_scan,
+    discover_hosts,
+    icmp_ping,
+    port_scan,
+    udp_scan,
+)
 
 
 class FakeAnswered:
@@ -142,6 +150,109 @@ def test_port_scan_no_open_ports(monkeypatch):
 
     monkeypatch.setattr(socket, "socket", ClosedSocket)
     assert port_scan(["192.168.1.10"], [80, 443], timeout=0.1) == []
+
+
+def test_port_scan_stream_returns_generator(monkeypatch):
+    import types
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+    gen = port_scan(["192.168.1.10"], [80, 443], timeout=0.1, stream=True)
+    assert isinstance(gen, types.GeneratorType)
+    results = list(gen)
+    assert results == [
+        {"ip": "192.168.1.10", "port": 80, "service": "http", "state": "open"}
+    ]
+
+
+def test_udp_scan_stream_yields_entries(monkeypatch):
+    monkeypatch.setattr(socket, "socket", FakeUDPSocket)
+    results = list(udp_scan(["192.168.1.10"], [53, 161], timeout=0.1, stream=True))
+    assert all(r["state"] == "open|filtered" for r in results)
+    assert len(results) == 2
+
+
+# --- UDP ---
+
+
+class FakeUDPSocket:
+    """Minimal UDP socket; recvfrom times out by default (open|filtered)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def settimeout(self, timeout):
+        pass
+
+    def connect(self, addr):
+        pass
+
+    def send(self, data):
+        pass
+
+    def recvfrom(self, bufsize):
+        raise socket.timeout()
+
+    def close(self):
+        pass
+
+
+def test_udp_scan_open(monkeypatch):
+    class OpenUDPSocket(FakeUDPSocket):
+        def recvfrom(self, bufsize):
+            return (b"response", ("192.168.1.10", 53))
+
+    monkeypatch.setattr(socket, "socket", OpenUDPSocket)
+    results = udp_scan(["192.168.1.10"], [53])
+    assert results == [
+        {"ip": "192.168.1.10", "port": 53, "service": "domain", "state": "open"}
+    ]
+
+
+def test_udp_scan_no_reply_is_open_filtered(monkeypatch):
+    monkeypatch.setattr(socket, "socket", FakeUDPSocket)
+    results = udp_scan(["192.168.1.10"], [53])
+    assert results == [
+        {"ip": "192.168.1.10", "port": 53, "service": "domain", "state": "open|filtered"}
+    ]
+
+
+def test_udp_scan_closed_hidden_by_default(monkeypatch):
+    class ClosedUDPSocket(FakeUDPSocket):
+        def recvfrom(self, bufsize):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    monkeypatch.setattr(socket, "socket", ClosedUDPSocket)
+    assert udp_scan(["192.168.1.10"], [53]) == []
+
+
+def test_udp_scan_include_closed(monkeypatch):
+    class ClosedUDPSocket(FakeUDPSocket):
+        def recvfrom(self, bufsize):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    monkeypatch.setattr(socket, "socket", ClosedUDPSocket)
+    results = udp_scan(["192.168.1.10"], [53], include_closed=True)
+    assert results == [
+        {"ip": "192.168.1.10", "port": 53, "service": "domain", "state": "closed"}
+    ]
+
+
+def test_udp_scan_windows_reset_is_closed(monkeypatch):
+    class ResetUDPSocket(FakeUDPSocket):
+        def recvfrom(self, bufsize):
+            raise ConnectionResetError(10054, "WSAECONNRESET")
+
+    monkeypatch.setattr(socket, "socket", ResetUDPSocket)
+    results = udp_scan(["192.168.1.10"], [53], include_closed=True)
+    assert results == [
+        {"ip": "192.168.1.10", "port": 53, "service": "domain", "state": "closed"}
+    ]
+
+
+def test_udp_scan_sorts_by_ip_and_port(monkeypatch):
+    monkeypatch.setattr(socket, "socket", FakeUDPSocket)
+    results = udp_scan(["192.168.1.10"], [80, 53])
+    assert [r["port"] for r in results] == [53, 80]
 
 
 # --- discover_hosts ---

@@ -27,14 +27,15 @@
 
 ## Features (v2)
 
-- **Three scan methods** (`arp`, `ping`, `tcp`) plus automatic `all` mode:
+- **Four scan methods** (`arp`, `ping`, `tcp`, `udp`) plus automatic `all` mode:
   - `arp` — Layer-2 host discovery on your local segment (IP + MAC + vendor)
   - `ping` — ICMP echo sweep
   - `tcp` — privilege-free TCP connect port scan (works without admin/root)
+  - `udp` — privilege-free UDP datagram scan (open / open|filtered / closed / filtered, with `--include-closed`)
   - `all` — runs ARP and ICMP, degrading gracefully if either needs privileges; if nothing is found, falls back to a TCP scan of common ports
 - **Flexible targets**: single IP, CIDR (`192.168.1.0/24`), hyphen ranges (`192.168.1.1-50`), hostnames, and comma-separated combinations
-- **MAC vendor lookup** from a built-in OUI database (plus custom `--vendor-db` support)
-- **Output formats**: aligned table, JSON, or CSV, written to stdout or a file (`-o`)
+- **MAC vendor lookup**: the full IEEE OUI database (~40k vendors) is bundled with the tool, layered under friendly curated names, plus custom `--vendor-db` overrides
+- **Output formats**: aligned table, JSON, CSV, or JSON Lines (`jsonl`) — the `jsonl` format **streams** port-scan results as they are discovered, so very large scans stay memory-bounded and `-o scan.jsonl` is tailable while it runs
 - **Concurrency & tuning**: `--concurrency`, `--timeout`, `--retries`, `--iface`
 - **Hostname resolution** for discovered devices (`--resolve`)
 - **Structured error handling**: clear messages for bad targets, missing privileges, and missing drivers — never a raw traceback
@@ -80,15 +81,23 @@ netscanner -t 192.168.1.0/24 -m arp
 # ICMP sweep of a range
 netscanner -t 192.168.1.1-192.168.1.50 -m ping
 
-# Port scan a single host (no privileges needed)
+# TCP port scan a single host (no privileges needed)
 netscanner -t 192.168.1.5 -m tcp -p 1-1000
 
-# Port scan with a custom port list
+# TCP port scan with a custom port list
 netscanner -t 192.168.1.5 -m tcp -p 22,80,443,8000-9000
+
+# UDP scan (DNS, SNMP, NTP...); closed ports shown with --include-closed
+netscanner -t 192.168.1.5 -m udp -p 53,161,500 --include-closed
 
 # Machine-readable output to a file
 netscanner -t 192.168.1.0/24 -f json -o scan.json
 netscanner -t 192.168.1.0/24 -f csv -o scan.csv
+
+# Streaming JSON Lines: one JSON object per line, written as results arrive.
+# Ideal for huge scans (e.g. all 65535 TCP ports) - tail the file while it runs.
+netscanner -t 192.168.1.5 -m tcp -p 1-65535 -f jsonl -o scan.jsonl
+netscanner -t 192.168.1.5 -m tcp -p 1-65535 -f jsonl | jq -c '.port'
 
 # Resolve hostnames and show MAC vendors
 netscanner -t 192.168.1.0/24 -m arp --resolve
@@ -114,9 +123,11 @@ IP Address    MAC Address       Vendor                  Hostname
 
 ```
 -t, --target TARGET   IP, CIDR range, hyphen range, hostname, or comma list
--m, --method          arp | ping | tcp | all   (default: all)
--p, --ports PORTS     Ports for -m tcp: '22', '80,443', '1-1000'
--f, --format          table | json | csv       (default: table)
+-m, --method          arp | ping | tcp | udp | all   (default: all)
+-p, --ports PORTS     Ports for -m tcp / -m udp: '22', '80,443', '1-1000'
+    --include-closed  With -m udp, also list closed/filtered ports
+-f, --format          table | json | csv | jsonl   (default: table)
+                      jsonl streams port-scan results as they are discovered
 -o, --output FILE     Write results to a file
     --iface IFACE     Network interface for ARP/ping (e.g. eth0, Wi-Fi)
     --timeout SECS    Timeout per probe          (default: 2.0)
@@ -153,8 +164,9 @@ All tests mock network access, so they run anywhere — no root or Npcap needed.
 | `ARP scan failed ... winpcap is not installed` | Install [Npcap](https://npcap.com/) and run as administrator |
 | `ICMP ping requires administrator/root privileges` | Run as root/admin, or use `-m tcp` |
 | `No devices found` | Try `-m ping` or `-m tcp`; the auto `all` mode does this for you |
+| UDP shows only `open|filtered` | Normal — most UDP services only reply to protocol-specific probes (DNS/SNMP/NTP queries); `open|filtered` means no reply and no ICMP error |
 | `Invalid target(s)` | Use IPv4, e.g. `192.168.1.0/24`, `192.168.1.1-50`, or a resolvable hostname |
-| Unknown MAC vendors | Provide a full IEEE OUI CSV via `--vendor-db` |
+| Unknown MAC vendors | Refresh the bundled database: `python tools/update_oui_db.py`, or supply your own `--vendor-db` CSV |
 
 ## Contributing
 
@@ -165,6 +177,16 @@ We welcome contributions! Please:
 3. Make your changes and add tests under `tests/`.
 4. Run `pytest` and push.
 5. Open a pull request.
+
+## Updating the MAC vendor database
+
+The tool ships with the official IEEE MA-L OUI database (`src/netscanner/data/oui.csv.gz`, ~40k vendors), downloaded from [standards-oui.ieee.org](https://standards-oui.ieee.org/oui/oui.csv). To refresh it with the latest assignments:
+
+```bash
+python tools/update_oui_db.py
+```
+
+Lookups check three layers, in order: your custom `--vendor-db` entries, the curated friendly-name table, then the full IEEE database.
 
 ## License
 

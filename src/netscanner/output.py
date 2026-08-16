@@ -49,6 +49,14 @@ def format_json(results: Iterable[Dict]) -> str:
     return json.dumps(list(results), indent=2)
 
 
+def format_jsonl(results: Iterable[Dict]) -> str:
+    """Render results as JSON Lines (one compact JSON object per line)."""
+    lines = [json.dumps(result) for result in results]
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
 def format_csv(results: Iterable[Dict], columns: Sequence[Tuple[str, str]]) -> str:
     """Render results as CSV with a human-readable header row."""
     keys = [key for key, _ in columns]

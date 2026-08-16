@@ -5,6 +5,7 @@ from netscanner.output import (
     PORT_COLUMNS,
     format_csv,
     format_json,
+    format_jsonl,
     format_table,
     write_output,
 )
@@ -36,6 +37,24 @@ def test_json_roundtrip():
 
 def test_json_empty_is_array():
     assert json.loads(format_json([])) == []
+
+
+def test_jsonl_one_object_per_line():
+    text = format_jsonl(HOSTS)
+    lines = [line for line in text.splitlines() if line]
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == HOSTS[0]
+    assert json.loads(lines[1]) == HOSTS[1]
+
+
+def test_jsonl_compact_and_trailing_newline():
+    text = format_jsonl(HOSTS)
+    assert text.endswith("\n")
+    assert text.count("\n") == 2
+
+
+def test_jsonl_empty_is_empty_string():
+    assert format_jsonl([]) == ""
 
 
 def test_csv_header_and_rows():

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from . import __version__
 from .output import (
@@ -13,13 +14,14 @@ from .output import (
     PORT_COLUMNS,
     format_csv,
     format_json,
+    format_jsonl,
     format_table,
     write_output,
 )
-from .scanner import COMMON_PORTS, ScanError, discover_hosts, port_scan
+from .scanner import COMMON_PORTS, ScanError, discover_hosts, port_scan, udp_scan
 from .target import TargetError, parse_ports, parse_targets
 from .utils import colorize, is_admin, setup_logging
-from .vendor import BUILTIN_OUI, load_vendor_db
+from .vendor import load_vendor_db
 
 LOG = logging.getLogger("netscanner")
 
@@ -51,14 +53,17 @@ def print_banner() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="netscanner",
-        description="Discover devices and open ports on your network (ARP, ICMP, TCP).",
+        description="Discover devices and open ports on your network (ARP, ICMP, TCP, UDP).",
         epilog=(
             "examples:\n"
             "  netscanner -t 192.168.1.0/24                     # auto: ARP + ICMP + TCP fallback\n"
             "  netscanner -t 192.168.1.0/24 -m arp              # local segment, needs admin/root\n"
             "  netscanner -t 192.168.1.0/24 -m ping             # ICMP sweep\n"
-            "  netscanner -t 192.168.1.5 -m tcp -p 1-1000       # port scan (no privileges needed)\n"
+            "  netscanner -t 192.168.1.5 -m tcp -p 1-1000       # TCP port scan (no privileges needed)\n"
+            "  netscanner -t 192.168.1.5 -m udp -p 53,161,500    # UDP scan (open/open|filtered)\n"
             "  netscanner -t 192.168.1.1-50 -f json -o out.json # JSON to file\n"
+            "  netscanner -t 192.168.1.5 -m tcp -p 1-65535 -f jsonl -o scan.jsonl\n"
+            "                                            # streams one JSON object per line\n"
             "  netscanner -t myrouter.local -m arp              # resolve a hostname first\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -78,9 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-m",
         "--method",
         dest="method",
-        choices=["arp", "ping", "tcp", "all"],
+        choices=["arp", "ping", "tcp", "udp", "all"],
         default="all",
-        help="Scan method (default: all)",
+        help="Scan method: arp, ping, tcp, udp, all (default: all)",
     )
     parser.add_argument(
         "-p",
@@ -88,15 +93,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ports",
         default=None,
         metavar="PORTS",
-        help="Ports for -m tcp: '22', '80,443', '1-1000' (default: common ports)",
+        help="Ports for -m tcp / -m udp: '22', '80,443', '1-1000' (default: common ports)",
     )
     parser.add_argument(
         "-f",
         "--format",
         dest="fmt",
-        choices=["table", "json", "csv"],
+        choices=["table", "json", "csv", "jsonl"],
         default="table",
-        help="Output format (default: table)",
+        help=(
+            "Output format: table, json, csv, or jsonl (default: table). "
+            "jsonl with -m tcp/-m udp streams each result as it is discovered."
+        ),
     )
     parser.add_argument(
         "-o",
@@ -144,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resolve hostnames for discovered hosts (slower)",
     )
     parser.add_argument(
+        "--include-closed",
+        dest="include_closed",
+        action="store_true",
+        help=(
+            "With -m udp, also report closed/filtered ports "
+            "(default: open and open|filtered only)"
+        ),
+    )
+    parser.add_argument(
         "--vendor-db",
         dest="vendor_db",
         default=None,
@@ -185,13 +202,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     vendor_db = None
     if args.vendor_db:
         try:
-            vendor_db = {**BUILTIN_OUI, **load_vendor_db(args.vendor_db)}
+            vendor_db = load_vendor_db(args.vendor_db)
         except (OSError, ValueError) as exc:
             print(f"ERROR: could not load vendor database: {exc}", file=sys.stderr)
             return 1
 
-    is_port_scan = args.method == "tcp" or args.ports is not None
-    if is_port_scan and args.method != "tcp":
+    is_port_scan = args.method in ("tcp", "udp") or args.ports is not None
+    if is_port_scan and args.method not in ("tcp", "udp"):
         LOG.info("Ports were specified; performing a TCP port scan")
 
     if not is_port_scan and not is_admin():
@@ -200,17 +217,62 @@ def main(argv: Optional[List[str]] = None) -> int:
             "use -m tcp if you lack them."
         )
 
+    if is_port_scan:
+        try:
+            ports = parse_ports(args.ports) if args.ports else COMMON_PORTS
+        except TargetError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        columns = PORT_COLUMNS
+    else:
+        ports = None
+        columns = HOST_COLUMNS
+
+    # jsonl streams port-scan results as they are discovered (memory-bounded,
+    # and tailable with -o); host discovery keeps collecting before emitting.
+    if args.fmt == "jsonl" and is_port_scan:
+        try:
+            if args.method == "udp":
+                entries = udp_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    concurrency=args.concurrency,
+                    include_closed=args.include_closed,
+                    stream=True,
+                )
+            else:
+                entries = port_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    concurrency=args.concurrency,
+                    resolve=args.resolve,
+                    stream=True,
+                )
+        except ScanError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        return _stream_jsonl(entries, args.output)
+
     try:
         if is_port_scan:
-            ports = parse_ports(args.ports) if args.ports else COMMON_PORTS
-            results = port_scan(
-                targets,
-                ports,
-                timeout=args.timeout,
-                concurrency=args.concurrency,
-                resolve=args.resolve,
-            )
-            columns = PORT_COLUMNS
+            if args.method == "udp":
+                results = udp_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    concurrency=args.concurrency,
+                    include_closed=args.include_closed,
+                )
+            else:
+                results = port_scan(
+                    targets,
+                    ports,
+                    timeout=args.timeout,
+                    concurrency=args.concurrency,
+                    resolve=args.resolve,
+                )
         else:
             results = discover_hosts(
                 targets,
@@ -222,10 +284,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 resolve=args.resolve,
                 vendor_db=vendor_db,
             )
-            columns = HOST_COLUMNS
-    except TargetError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
     except ScanError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -234,6 +292,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         text = format_json(results)
     elif args.fmt == "csv":
         text = format_csv(results, columns)
+    elif args.fmt == "jsonl":
+        text = format_jsonl(results)
     else:
         text = format_table(results, columns)
 
@@ -258,6 +318,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     print(text)
+    return 0
+
+
+def _stream_jsonl(entries: Iterable[dict], path: Optional[str]) -> int:
+    """Emit scan entries as JSON Lines, streaming to stdout or a file.
+
+    With a path, results are written progressively to the file (tailable while
+    the scan runs) and a summary goes to stdout. Without one, each line goes
+    to stdout and any messages go to stderr so the stream stays pure JSONL.
+    """
+    count = 0
+    try:
+        if path:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                for entry in entries:
+                    fh.write(json.dumps(entry) + "\n")
+                    count += 1
+            print(f"Wrote {count} result(s) to {path}")
+        else:
+            for entry in entries:
+                print(json.dumps(entry))
+                count += 1
+            if count == 0:
+                print("No open ports found.", file=sys.stderr)
+    except ScanError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"ERROR: could not write output file: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
