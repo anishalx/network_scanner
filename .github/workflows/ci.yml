@@ -64,6 +64,11 @@ jobs:
           /tmp/ns-venv/bin/pip install dist/*.whl
 
       - name: Smoke-test the installed console script
+        # Run from a neutral directory: the repo root contains a legacy
+        # netscanner.py shim that would shadow the installed package when
+        # Python prepends the CWD to sys.path, so the import here must not
+        # resolve against the source tree.
+        working-directory: /tmp
         run: |
           /tmp/ns-venv/bin/netscanner --version
           /tmp/ns-venv/bin/python -c "from netscanner.vendor import lookup_vendor; assert lookup_vendor('b8:27:eb') == 'Raspberry Pi Foundation'"
