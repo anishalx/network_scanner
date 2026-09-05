@@ -58,6 +58,11 @@ def print_banner() -> None:
             print(colorize(line, "yellow"))
         else:
             print(colorize(line, "red"))
+    print(colorize(
+        "\n[!] NetScanner is for authorized security assessments only. "
+        "Scanning networks you do not own or lack permission to test is illegal.",
+        "yellow",
+    ))
 
 
 def build_parser() -> argparse.ArgumentParser:

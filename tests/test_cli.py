@@ -37,6 +37,16 @@ def test_no_banner_flag(monkeypatch, capsys):
     assert "Version" not in capsys.readouterr().out
 
 
+def test_banner_includes_legal_disclaimer(monkeypatch, capsys):
+    """The banner must carry the authorized-use disclaimer."""
+    monkeypatch.setattr(cli, "discover_hosts", lambda *a, **k: FAKE_HOSTS)
+    code = cli.main(["-t", "192.168.1.10"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "authorized security assessments only" in out
+    assert "illegal" in out
+
+
 def test_json_output(monkeypatch, capsys):
     monkeypatch.setattr(cli, "discover_hosts", lambda *a, **k: FAKE_HOSTS)
     code = cli.main(["-t", "192.168.1.10", "-m", "ping", "-f", "json"])

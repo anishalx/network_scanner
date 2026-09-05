@@ -218,6 +218,13 @@ python tools/update_oui_db.py
 
 Lookups check three layers, in order: your custom `--vendor-db` entries, the curated friendly-name table, then the full IEEE database.
 
+## Disclaimer
+
+NetScanner is intended for **authorized security assessments only** — scanning
+networks or systems you do not own or lack permission to test is illegal in
+most jurisdictions. The tool prints this notice in its banner; obtain explicit
+written permission from the network owner before every scan.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
